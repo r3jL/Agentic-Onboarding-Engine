@@ -52,7 +52,7 @@
 |-------|-----------|
 | AI Model | **Qwen2.5:7b** via **Ollama** by default (fully offline), or any OpenAI-compatible API (Groq, Gemini, OpenRouter…) |
 | Backend | **FastAPI** (Python 3.11+) |
-| Database | **SQLite** via Python's built-in `sqlite3` |
+| Database | **SQLite** locally; **Postgres** (Neon) when `DATABASE_URL` is set |
 | PDF Parsing | **pdfplumber** (column-aware extraction) |
 | Auth | **Firebase Authentication** (Google sign-in + email/password) |
 | Frontend | **Vanilla JavaScript** + **Tailwind CSS** (CDN) + **Font Awesome 6** |
@@ -219,6 +219,7 @@ Level:  ≥85% → advanced
 |----------|----------|-------------|
 | `ADMIN_PASSWORD` | Yes | Password for the `/admin.html` page |
 | `DB_PATH` | No | SQLite file path (default: `onboarding.db`, set to `/app/data/onboarding.db` in Docker) |
+| `DATABASE_URL` | No | Postgres connection string; when set, it's used instead of SQLite (set automatically by the Neon integration on Vercel) |
 | `LLM_BASE_URL` | No | OpenAI-compatible API base URL (default: `http://localhost:11434/v1`, i.e. local Ollama) |
 | `LLM_API_KEY` | No | API key for the provider (ignored by Ollama) |
 | `LLM_MODEL` | No | Model name (default: `qwen2.5:7b`) |
@@ -235,16 +236,28 @@ LLM token usage is logged per call (`LLM <step>: N prompt + M completion tokens`
 
 ## Deploying online (hosted LLM)
 
-Ollama needs several GB of RAM and ideally a GPU, which free hosting tiers don't provide. For a public deployment, use a hosted LLM API instead — no code changes needed:
+Ollama needs several GB of RAM and ideally a GPU, which free hosting tiers don't provide. For a public deployment, use a hosted LLM API instead (see the examples in `.env.example`).
 
-1. Get an API key from an OpenAI-compatible provider (see the examples in `.env.example`).
-2. Deploy the repo's `Dockerfile` to a container host. The default build skips Ollama, so the image stays small.
-3. Set `ADMIN_PASSWORD`, `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` as environment variables on the host.
-4. Add the deployed domain to **Firebase → Authentication → Settings → Authorized domains**, or sign-in will fail.
+### Vercel (live: https://agentic-onboarding-engine.vercel.app)
 
-`start.sh` skips Ollama automatically whenever `LLM_BASE_URL` isn't a localhost address.
+Vercel auto-detects the FastAPI app (`app/main.py`) and serves `public/` from its CDN. Serverless functions can't keep a SQLite file, so production uses **Neon Postgres** from the Vercel Marketplace; `database.py` switches to Postgres automatically when `DATABASE_URL` is set.
 
-> **Note:** SQLite lives on the container's disk. On hosts without a persistent volume, data (sessions, the manager whitelist and the question bank) resets when the container restarts or redeploys.
+```bash
+vercel link
+vercel integration add neon          # free plan; injects DATABASE_URL
+vercel env add LLM_API_KEY production  # also ADMIN_PASSWORD, LLM_BASE_URL, LLM_MODEL
+vercel deploy --prod
+```
+
+The repo is connected to the Vercel project, so pushes to `main` deploy automatically. `.vercelignore` keeps `.env`, tests and local data out of the upload.
+
+### Any container host
+
+Deploy the repo's `Dockerfile` (the default build skips Ollama) and set `ADMIN_PASSWORD`, `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`. Set `DATABASE_URL` to a Postgres database to keep data across restarts; otherwise SQLite on the container disk resets on redeploy. `start.sh` skips Ollama automatically whenever `LLM_BASE_URL` isn't a localhost address.
+
+### Either way
+
+Add the deployed domain to **Firebase → Authentication → Settings → Authorized domains**, or sign-in will fail.
 
 ---
 
@@ -269,8 +282,8 @@ hecklers/
 │   ├── ai_engine.py      # LLM integration, question bank, gap scoring
 │   ├── resume_intake.py  # Résumé file checks, extraction, verification, trimming
 │   ├── schemas.py        # Pydantic models for structured LLM output
-│   └── database.py       # SQLite operations (init, CRUD, question bank)
-├── static/
+│   └── database.py       # SQLite / Postgres operations (init, CRUD, question bank)
+├── public/
 │   ├── index.html        # Employee onboarding SPA
 │   ├── manager.html      # Manager dashboard
 │   └── admin.html        # Admin panel

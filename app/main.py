@@ -812,8 +812,11 @@ async def admin_remove_manager(email: str, request: Request):
 # Static file serving (SPA)
 # ---------------------------------------------------------------------------
 
-# Serve the frontend SPA from the static/ directory
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+# Serve the frontend SPA from public/. On Vercel the CDN serves public/ itself and
+# the directory isn't bundled into the function, so only mount it when present.
+_PUBLIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "public")
+if os.path.isdir(_PUBLIC_DIR):
+    app.mount("/", StaticFiles(directory=_PUBLIC_DIR, html=True), name="static")
 
 
 # ---------------------------------------------------------------------------

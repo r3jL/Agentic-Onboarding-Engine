@@ -1,0 +1,19 @@
+# Never upload secrets, local environments or local data
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+.pytest_cache/
+.DS_Store
+
+# Not needed by the deployed function
+tests/
+requirements-dev.txt
+Dockerfile
+docker-compose.yml
+.dockerignore
+start.sh

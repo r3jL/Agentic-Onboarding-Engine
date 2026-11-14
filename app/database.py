@@ -1,5 +1,10 @@
 """
-database.py - SQLite database operations for the AI Onboarding Engine.
+database.py - Database operations for the AI Onboarding Engine.
+
+Uses SQLite by default (DB_PATH). When DATABASE_URL (or POSTGRES_URL) is set,
+e.g. by the Neon integration on Vercel, the same queries run on Postgres
+through a thin adapter that translates SQLite-isms (`?` placeholders,
+INSERT OR IGNORE).
 
 Tables:
   - sessions: stores all candidate/session data including resume, JD, skill gaps, questionnaire, pathway
@@ -7,6 +12,7 @@ Tables:
   - question_bank: generated MCQs shared across sessions (cuts repeat LLM calls)
 """
 
+import atexit
 import os
 import sqlite3
 import json
@@ -17,21 +23,98 @@ from typing import Any, Dict, List, Optional
 
 # Path to the SQLite database file
 DB_PATH = os.environ.get("DB_PATH", "onboarding.db")
+# Postgres connection string (set by the Neon integration on Vercel)
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 
 # skill_tests columns stored as JSON text
 _SKILL_TEST_JSON_FIELDS = ("questions", "answers", "seen_question_ids")
 
 
-def get_connection() -> sqlite3.Connection:
-    """Return a new SQLite connection with row_factory for dict-like access."""
+class _PgConnection:
+    """
+    Wraps a pooled psycopg connection so callers can use the sqlite3-style API
+    (`execute`, `cursor`, `commit`, `close`) and SQLite-flavoured SQL.
+    Rows are dicts, so `row["col"]` and `dict(row)` work as with sqlite3.Row.
+    """
+
+    def __init__(self, pool):
+        self._pool = pool
+        self._conn = pool.getconn()
+
+    @staticmethod
+    def _sql(sql: str) -> str:
+        if sql.lstrip().upper().startswith("INSERT OR IGNORE"):
+            sql = sql.replace("INSERT OR IGNORE", "INSERT", 1) + " ON CONFLICT DO NOTHING"
+        return sql.replace("?", "%s")
+
+    def execute(self, sql: str, params=()):
+        return self._conn.execute(self._sql(sql), params)
+
+    def cursor(self):
+        return self
+
+    def commit(self):
+        pass  # autocommit: each statement is committed as it runs
+
+    def close(self):
+        if self._conn is not None:
+            self._pool.putconn(self._conn)
+            self._conn = None
+
+
+_pg_pool = None
+_initialized = False
+
+
+def _get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+
+        _pg_pool = ConnectionPool(
+            DATABASE_URL,
+            min_size=0,
+            max_size=int(os.environ.get("DB_POOL_SIZE", "5")),
+            # autocommit saves a BEGIN and a ROLLBACK round trip per query;
+            # prepare_threshold=None: server-side prepared statements break behind PgBouncer
+            kwargs={"row_factory": dict_row, "prepare_threshold": None, "autocommit": True},
+            open=True,
+        )
+        atexit.register(_pg_pool.close)
+    return _pg_pool
+
+
+def _connect():
+    if DATABASE_URL:
+        return _PgConnection(_get_pg_pool())
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def get_connection():
+    """Return a connection (SQLite or Postgres) with dict-like rows."""
+    if not _initialized:
+        init_db()  # serverless platforms may not run the startup hook
+    return _connect()
+
+
+def _add_column(cursor, table: str, column_def: str):
+    """Add a column if it doesn't exist (Postgres supports IF NOT EXISTS; SQLite doesn't)."""
+    if DATABASE_URL:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column_def}")
+        return
+    try:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+    except sqlite3.OperationalError:
+        pass
+
+
 def init_db():
     """Initialize the database by creating tables if they don't exist."""
-    conn = get_connection()
+    global _initialized
+    conn = _connect()
     try:
         cursor = conn.cursor()
 
@@ -72,14 +155,8 @@ def init_db():
         """)
 
         # Add firebase_uid and user_email to sessions if not present (migration)
-        try:
-            cursor.execute("ALTER TABLE sessions ADD COLUMN firebase_uid TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            cursor.execute("ALTER TABLE sessions ADD COLUMN user_email TEXT")
-        except sqlite3.OperationalError:
-            pass
+        _add_column(cursor, "sessions", "firebase_uid TEXT")
+        _add_column(cursor, "sessions", "user_email TEXT")
 
         # Managers whitelist table — just emails, auth handled by Firebase
         cursor.execute("""
@@ -91,7 +168,8 @@ def init_db():
         """)
 
         # Migration: drop password_hash column if the table was created with old schema
-        cols = [row[1] for row in cursor.execute("PRAGMA table_info(managers)").fetchall()]
+        # (SQLite only — Postgres databases were never created with it)
+        cols = [] if DATABASE_URL else [row[1] for row in cursor.execute("PRAGMA table_info(managers)").fetchall()]
         if "password_hash" in cols:
             cursor.execute("ALTER TABLE managers RENAME TO managers_old")
             cursor.execute("""
@@ -139,13 +217,11 @@ def init_db():
         )
 
         # Bank question ids a session has already seen in a skill test, so retests differ
-        try:
-            cursor.execute("ALTER TABLE skill_tests ADD COLUMN seen_question_ids TEXT")
-        except sqlite3.OperationalError:
-            pass
+        _add_column(cursor, "skill_tests", "seen_question_ids TEXT")
 
         conn.commit()
-        print("Database initialized successfully.")
+        _initialized = True
+        print(f"Database initialized successfully ({'Postgres' if DATABASE_URL else 'SQLite'}).")
     finally:
         conn.close()
 
