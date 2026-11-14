@@ -1,45 +1,173 @@
 """
-ai_engine.py - Local AI integration for the AI Onboarding Engine.
+ai_engine.py - AI integration for the AI Onboarding Engine.
 
-Uses Ollama (localhost:11434) serving Qwen2.5-7B via an OpenAI-compatible API.
-No API key required — runs entirely offline.
+Talks to any OpenAI-compatible chat completions API. By default this is a local
+Ollama server (localhost:11434) serving Qwen2.5-7B, with no API key required.
+Set LLM_BASE_URL / LLM_API_KEY / LLM_MODEL to use a hosted provider instead
+(e.g. Groq, Google Gemini, OpenRouter) — see .env.example.
 
-Key design decisions:
-- JSON is parsed with markdown fence stripping for robustness
+Token-saving design:
+- Structured output (JSON schema) where the provider supports it, with a
+  plain-JSON fallback; compact prompts with instructions first, data last.
+- Gap analysis is computed in Python; the LLM only matches skill names.
+- Questions live in a shared bank (database.question_bank) and are reused
+  across sessions; only shortfalls are generated, one call per skill, in parallel.
+- Option order and the "I don't know" option are handled in Python.
+- Test feedback is templated rather than generated.
 """
 
+import asyncio
 import json
-import re
+import logging
 import os
-from typing import Any, Dict, List, Optional
+import random
+import re
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
-from openai import OpenAI
+import openai
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import ValidationError
+
+from app import database
+from app.schemas import (
+    GeneratedMCQ,
+    JDData,
+    MatchResult,
+    MCQBatch,
+    Pathway,
+    ResumeData,
+    response_format,
+)
 
 load_dotenv()
+log = logging.getLogger(__name__)
 
-MODEL = "qwen2.5:7b"
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "ollama")  # Ollama ignores the key
+MODEL = os.environ.get("LLM_MODEL", "qwen2.5:7b")
+# Optional cap on max_tokens, for providers with a lower output limit
+_MAX_TOKENS_CAP = int(os.environ["LLM_MAX_TOKENS"]) if os.environ.get("LLM_MAX_TOKENS") else None
+# Extra tokens per request for reasoning models, whose hidden "thinking" counts
+# against max_tokens (budgets below are sized for the visible answer only)
+_REASONING_BUDGET = int(os.environ.get("LLM_REASONING_BUDGET", "0"))
+# Max LLM requests in flight at once (parallel question generation respects this)
+_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("LLM_CONCURRENCY", "4")))
+# Structured output is switched off automatically if the provider rejects it
+_use_json_schema = os.environ.get("LLM_JSON_SCHEMA", "true").lower() != "false"
 
-# Lazy client — initialized on first use
-_client: Optional[OpenAI] = None
+IDK_OPTION = "I don't know"
+SKILL_TEST_SIZE = 10
+SKILL_TEST_PASS_MARK = 75
 
-def _get_client() -> OpenAI:
+_client: Optional[AsyncOpenAI] = None
+
+
+def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
-        _client = OpenAI(
-            base_url="http://localhost:11434/v1",
-            api_key="ollama",  # required by the OpenAI client but ignored by Ollama
+        _client = AsyncOpenAI(
+            base_url=LLM_BASE_URL,
+            api_key=LLM_API_KEY,
+            timeout=float(os.environ.get("LLM_TIMEOUT", "600")),
+            # Retries are handled in _complete with longer backoff than the SDK's
+            max_retries=0,
         )
     return _client
 
 
 # ---------------------------------------------------------------------------
-# Helper utilities
+# Low-level helpers
 # ---------------------------------------------------------------------------
 
+# Free tiers often return 429 with no retry-after; the SDK's sub-second backoff
+# just burns quota, so wait longer between attempts.
+_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "4"))
+_BACKOFF_SECONDS = (2, 8, 20, 45)
+_RETRYABLE = (openai.RateLimitError, openai.APIConnectionError, openai.InternalServerError)
+
+
+def _retry_delay(error: Exception, attempt: int) -> float:
+    delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
+    response = getattr(error, "response", None)
+    try:
+        delay = max(delay, float(response.headers.get("retry-after")))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return min(delay, 120) * random.uniform(1.0, 1.25)
+
+
+async def _complete(label: str, max_tokens: int, messages: List[Dict[str, str]], **extra):
+    """Run one chat completion, bounded by the concurrency limit, and log token usage."""
+    max_tokens += _REASONING_BUDGET
+    if _MAX_TOKENS_CAP is not None:
+        max_tokens = min(max_tokens, _MAX_TOKENS_CAP)
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            async with _SEMAPHORE:
+                response = await _get_client().chat.completions.create(
+                    model=MODEL, max_tokens=max_tokens, messages=messages, **extra
+                )
+            break
+        except _RETRYABLE as e:
+            # A daily quota won't reset within any backoff window; fail fast
+            if attempt == _MAX_RETRIES or re.search(r"per[- ]day|daily", str(e), re.I):
+                raise
+            delay = _retry_delay(e, attempt)
+            log.warning("LLM %s: %s, retrying in %.0fs (%d/%d)",
+                        label, type(e).__name__, delay, attempt + 1, _MAX_RETRIES)
+            await asyncio.sleep(delay)  # outside the semaphore, so other calls can proceed
+    usage = getattr(response, "usage", None)
+    if usage:
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning = getattr(details, "reasoning_tokens", None) or 0
+        log.info("LLM %s: %s prompt + %s completion tokens%s", label, usage.prompt_tokens,
+                 usage.completion_tokens, f" ({reasoning} reasoning)" if reasoning else "")
+    if response.choices and getattr(response.choices[0], "finish_reason", None) == "length":
+        log.warning("LLM %s: reply cut off at max_tokens=%s; raise LLM_MAX_TOKENS or use a "
+                    "non-reasoning model", label, max_tokens)
+    return response
+
+
 def _get_text(response) -> str:
-    """Extract text content from an Ollama chat completion response."""
+    """Extract text content from a chat completion response."""
     return response.choices[0].message.content or ""
+
+
+async def _complete_json(label: str, prompt: str, schema: type, max_tokens: int) -> Any:
+    """
+    Ask for JSON matching `schema`. Uses `response_format=json_schema` when the
+    provider supports it; if the provider rejects that, falls back (once, for the
+    rest of the process) to plain prompting + tolerant parsing.
+    """
+    global _use_json_schema
+    messages = [
+        {"role": "system", "content": "You reply with a single valid JSON object and nothing else."},
+        {"role": "user", "content": prompt},
+    ]
+    for attempt in range(2):  # one retry if the reply isn't valid JSON
+        if attempt:
+            max_tokens *= 2  # the usual cause is a reply cut off at the token limit
+        try:
+            if _use_json_schema:
+                try:
+                    response = await _complete(label, max_tokens, messages,
+                                               response_format=response_format(schema))
+                except openai.BadRequestError as e:
+                    if not re.search(r"response_format|schema|json", str(e), re.I):
+                        raise
+                    log.warning("Provider rejected json_schema output; using plain JSON prompting. (%s)", e)
+                    _use_json_schema = False
+                    response = await _complete(label, max_tokens, messages)
+            else:
+                response = await _complete(label, max_tokens, messages)
+            return _parse_json_response(_get_text(response))
+        except ValueError as e:
+            if attempt == 1:
+                raise
+            log.warning("LLM %s: invalid JSON, retrying once with double the token budget (%s)",
+                        label, str(e).splitlines()[0])
 
 
 def _parse_json_response(text: str) -> Any:
@@ -79,301 +207,434 @@ def _parse_json_response(text: str) -> Any:
         raise ValueError(f"Could not parse JSON from model response: {e}\nText was: {text[:500]}")
 
 
+def _compact(data: Any) -> str:
+    """JSON without whitespace — pretty-printing only costs tokens."""
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+
+def skill_key(name: str) -> str:
+    """Normalised skill name used as the question-bank key ("Node.JS " -> "node.js")."""
+    return re.sub(r"[^a-z0-9+#.]+", " ", (name or "").lower()).strip()
+
+
+def _question_norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
 # ---------------------------------------------------------------------------
-# Core AI Functions
+# Resume and job description parsing
 # ---------------------------------------------------------------------------
 
-def parse_resume(text: str) -> Dict[str, Any]:
+async def parse_resume(text: str) -> Dict[str, Any]:
     """
-    Extract structured information from resume text.
+    Extract structured information from résumé text.
 
-    Returns:
-        {
-            candidate_name: str,
-            skills: [{name, proficiency, years}],
-            work_experience: [{company, title, duration, description}],
-            education: [{degree, institution, year}],
-            total_experience_years: float
-        }
+    Returns ResumeData as a dict. `is_resume` is False (with `not_resume_reason`)
+    when the model judges the document is not a résumé — the caller rejects it.
     """
-    prompt = f"""You are an expert HR analyst and resume parser. Analyze the following resume text and extract structured information.
-
-RESUME TEXT:
-{text}
-
-Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
-{{
-    "candidate_name": "Full Name",
-    "skills": [
-        {{"name": "Python", "proficiency": "advanced", "years": 5}},
-        {{"name": "Machine Learning", "proficiency": "intermediate", "years": 2}}
-    ],
-    "work_experience": [
-        {{
-            "company": "Company Name",
-            "title": "Job Title",
-            "duration": "2020-2023",
-            "description": "Brief description of responsibilities and achievements"
-        }}
-    ],
-    "education": [
-        {{
-            "degree": "Bachelor of Science in Computer Science",
-            "institution": "University Name",
-            "year": "2019"
-        }}
-    ],
-    "total_experience_years": 4.5
-}}
-
+    prompt = f"""You parse résumés. First decide whether the document below is a résumé/CV (a person's professional profile: work history, education, skills).
+If it is NOT a résumé, return {{"is_resume":false,"not_resume_reason":"<what it appears to be, max 12 words>"}}.
+If it is, return:
+{{"is_resume":true,"candidate_name":str,"skills":[{{"name":str,"proficiency":"beginner|basic|intermediate|advanced|expert","years":number}}],"work_experience":[{{"company":str,"title":str,"duration":str}}],"education":[{{"degree":str,"institution":str,"year":str}}],"total_experience_years":number}}
 Rules:
-- proficiency must be one of: beginner, basic, intermediate, advanced, expert
-- years should be a number (0 if unknown)
-- total_experience_years should be the sum of professional experience
-- Extract ALL skills mentioned, including soft skills and domain knowledge
-- If information is missing, use reasonable defaults or empty arrays
-- Return ONLY the JSON, nothing else"""
+- skills: technical skills, tools, frameworks and domain knowledge; at most 5 soft skills.
+- proficiency: judge from years, role seniority and how the skill is used.
+- years: 0 if unknown. total_experience_years: total professional experience.
 
-    response = _get_client().chat.completions.create(
-        model=MODEL,
-        max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}]
-    )
+DOCUMENT:
+<<<
+{text}
+>>>"""
+    for attempt in range(2):
+        raw = await _complete_json("parse_resume", prompt, ResumeData, max_tokens=2500)
+        resume = ResumeData.model_validate(raw)
+        if not resume.is_resume or resume.skills:
+            return resume.model_dump()
+        log.warning("LLM parse_resume: no skills extracted (attempt %d)", attempt + 1)
+    raise ValueError("the AI model returned no skills for this résumé; please try again")
 
-    return _parse_json_response(_get_text(response))
 
-
-def parse_job_description(text: str) -> Dict[str, Any]:
-    """
-    Extract structured information from a job description.
-
-    Returns:
-        {
-            role_title: str,
-            required_skills: [{name, level, importance}],
-            responsibilities: [str],
-            required_experience_years: float
-        }
-    """
-    prompt = f"""You are an expert HR analyst and job description parser. Analyze the following job description and extract structured information.
+async def parse_job_description(text: str) -> Dict[str, Any]:
+    """Extract role title, required skills (level + importance), responsibilities, years."""
+    prompt = f"""You parse job descriptions. Return:
+{{"role_title":str,"required_skills":[{{"name":str,"level":"basic|intermediate|advanced|expert","importance":"required|preferred|nice_to_have"}}],"responsibilities":[str],"required_experience_years":number}}
+Rules:
+- required_skills: at most 12 distinct skills, each a technology, tool or discipline under its common industry name (e.g. "Machine Learning", "Kubernetes", "Apache Kafka"), with the level the role needs.
+- Fold sub-topics into their parent skill (e.g. evaluation metrics and feature engineering belong to Machine Learning) and merge overlapping items (e.g. "streaming data" and "Kafka").
+- responsibilities: at most 6, each under 12 words.
+- required_experience_years: 0 if not stated.
 
 JOB DESCRIPTION:
+<<<
 {text}
-
-Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
-{{
-    "role_title": "Senior Software Engineer",
-    "required_skills": [
-        {{"name": "Python", "level": "advanced", "importance": "required"}},
-        {{"name": "AWS", "level": "intermediate", "importance": "preferred"}},
-        {{"name": "Docker", "level": "basic", "importance": "nice_to_have"}}
-    ],
-    "responsibilities": [
-        "Design and implement scalable microservices",
-        "Collaborate with cross-functional teams",
-        "Mentor junior developers"
-    ],
-    "required_experience_years": 5.0
-}}
-
-Rules:
-- level must be one of: basic, intermediate, advanced, expert
-- importance must be one of: required, preferred, nice_to_have
-- List ALL skills mentioned, including tools, frameworks, methodologies
-- Extract specific years of experience if mentioned
-- responsibilities should be concise bullet points
-- Return ONLY the JSON, nothing else"""
-
-    response = _get_client().chat.completions.create(
-        model=MODEL,
-        max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return _parse_json_response(_get_text(response))
+>>>"""
+    for attempt in range(2):
+        raw = await _complete_json("parse_jd", prompt, JDData, max_tokens=1500)
+        jd = JDData.model_validate(raw)
+        if jd.required_skills:
+            return jd.model_dump()
+        log.warning("LLM parse_jd: no skills extracted (attempt %d)", attempt + 1)
+    raise ValueError("no skills could be found in this job description; check it lists the role's requirements")
 
 
-def analyze_skill_gap(resume_data: Dict, jd_data: Dict) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Skill gap analysis (LLM matches names; Python does the scoring)
+# ---------------------------------------------------------------------------
+
+LEVEL_RANK = {"none": 0, "beginner": 1, "basic": 2, "intermediate": 3, "advanced": 4, "expert": 5}
+IMPORTANCE_WEIGHT = {"required": 3, "preferred": 2, "nice_to_have": 1}
+_IMPORTANCE_BONUS = {"required": 1, "preferred": -1, "nice_to_have": -2}
+SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+async def analyze_skill_gap(resume_data: Dict, jd_data: Dict) -> Dict[str, Any]:
     """
-    Perform a detailed skill gap analysis comparing candidate's resume to job requirements.
+    Compare the résumé with the job requirements.
 
     Returns:
-        {
-            overall_fit_score: int (0-100),
-            strong_matches: [str],
-            skill_gaps: [{skill, candidate_level, required_level, gap_severity, priority, reason}],
-            missing_skills: [str],
-            summary: str
-        }
+        {overall_fit_score, strong_matches, skill_gaps: [{skill, candidate_level,
+         required_level, gap_severity, priority, reason, importance}],
+         missing_skills, summary}
     """
-    prompt = f"""You are an expert talent acquisition specialist performing a comprehensive skill gap analysis.
+    jd_skills = [
+        {"name": s["name"], "level": s["level"], "importance": s["importance"]}
+        for s in jd_data.get("required_skills", [])
+    ]
+    resume_skills = [
+        {"name": s["name"], "proficiency": s["proficiency"], "years": s.get("years", 0)}
+        for s in resume_data.get("skills", [])
+    ]
+    match_result: Dict[str, Any] = {"matches": [], "summary": ""}
+    if jd_skills:
+        prompt = f"""Match each job requirement to the candidate's résumé skills.
+For each job skill return resume_skill = the résumé skill that is the same or directly demonstrates it (e.g. "Postgres" for "PostgreSQL", "Django" for "Python"), or null if there is no evidence.
+reason: max 15 words on how the candidate's evidence compares with what the role needs.
+summary: 2 sentences on the candidate's overall fit.
+Return: {{"matches":[{{"jd_skill":str,"resume_skill":str|null,"reason":str}}],"summary":str}}
 
-CANDIDATE PROFILE:
-{json.dumps(resume_data, indent=2)}
+ROLE: {jd_data.get('role_title', '')} ({jd_data.get('required_experience_years', 0)}+ years)
+JOB SKILLS: {_compact(jd_skills)}
+CANDIDATE: {resume_data.get('total_experience_years', 0)} years; SKILLS: {_compact(resume_skills)}"""
+        raw = await _complete_json("match_skills", prompt, MatchResult, max_tokens=60 * len(jd_skills) + 300)
+        match_result = MatchResult.model_validate(raw).model_dump()
 
-JOB REQUIREMENTS:
-{json.dumps(jd_data, indent=2)}
+    return compute_gap_analysis(resume_data, jd_data, match_result)
 
-Perform a thorough analysis and return ONLY a valid JSON object with this exact structure:
-{{
-    "overall_fit_score": 72,
-    "strong_matches": ["Python", "SQL", "Data Analysis"],
-    "skill_gaps": [
-        {{
-            "skill": "Machine Learning",
-            "candidate_level": "basic",
-            "required_level": "advanced",
-            "gap_severity": "high",
-            "priority": 1,
-            "reason": "Core requirement for role; candidate has theoretical knowledge but lacks production ML experience"
-        }},
-        {{
-            "skill": "Kubernetes",
-            "candidate_level": "none",
-            "required_level": "intermediate",
-            "gap_severity": "medium",
-            "priority": 2,
-            "reason": "Required for deployment pipelines; no experience detected"
-        }}
-    ],
-    "missing_skills": ["GraphQL", "Terraform"],
-    "summary": "The candidate shows strong programming fundamentals but needs significant upskilling in ML engineering and cloud infrastructure to meet role requirements."
-}}
 
-Rules:
-- overall_fit_score: 0-100 based on how well candidate matches the role
-- gap_severity: critical, high, medium, low
-- priority: 1 (most important) to N (least important)
-- candidate_level: none, beginner, basic, intermediate, advanced, expert
-- strong_matches: skills where candidate meets or exceeds requirements
-- missing_skills: required skills with zero evidence in resume
-- Be specific and actionable in reasons
-- Return ONLY the JSON, nothing else"""
+def compute_gap_analysis(resume_data: Dict, jd_data: Dict, match_result: Dict) -> Dict[str, Any]:
+    """Deterministic gap scoring from parsed data plus the LLM's skill-name matches."""
+    resume_by_name = {s["name"].strip().lower(): s for s in resume_data.get("skills", [])}
+    matches = {
+        (m.get("jd_skill") or "").strip().lower(): m for m in match_result.get("matches", [])
+    }
 
-    response = _get_client().chat.completions.create(
-        model=MODEL,
-        max_tokens=5000,
-        messages=[{"role": "user", "content": prompt}]
+    strong_matches, gaps, missing = [], [], []
+    weighted_fit = total_weight = 0.0
+
+    for req in jd_data.get("required_skills", []):
+        name = req["name"]
+        importance = req.get("importance", "required")
+        required_level = req.get("level", "intermediate")
+        weight = IMPORTANCE_WEIGHT.get(importance, 3)
+        match = matches.get(name.strip().lower(), {})
+
+        matched = resume_by_name.get((match.get("resume_skill") or "").strip().lower()) \
+            or resume_by_name.get(name.strip().lower())
+        candidate_level = matched["proficiency"] if matched else "none"
+
+        req_rank = LEVEL_RANK.get(required_level, 3)
+        cand_rank = LEVEL_RANK.get(candidate_level, 0)
+        total_weight += weight
+        weighted_fit += weight * min(cand_rank / req_rank, 1.0) if req_rank else weight
+
+        diff = req_rank - cand_rank
+        if diff <= 0:
+            strong_matches.append(name)
+            continue
+
+        # e.g. required none->advanced = 5 (critical); required none->intermediate = 4 (high);
+        # required basic->intermediate = 2 (medium); nice-to-have none->intermediate = 1 (low)
+        severity_score = diff + _IMPORTANCE_BONUS.get(importance, 0)
+        severity = ("critical" if severity_score >= 5 else "high" if severity_score >= 3
+                    else "medium" if severity_score == 2 else "low")
+        reason = (match.get("reason") or "").strip() or (
+            f"Résumé shows {candidate_level} level; the role needs {required_level}."
+            if matched else f"No evidence of {name} in the résumé."
+        )
+        gaps.append({
+            "skill": name,
+            "candidate_level": candidate_level,
+            "required_level": required_level,
+            "gap_severity": severity,
+            "importance": importance,
+            "reason": reason,
+            "_sort": (SEVERITY_RANK[severity], -weight, -diff),
+        })
+        if not matched and importance == "required":
+            missing.append(name)
+
+    gaps.sort(key=lambda g: g["_sort"])
+    for priority, gap in enumerate(gaps, start=1):
+        gap["priority"] = priority
+        del gap["_sort"]
+
+    skill_fit = weighted_fit / total_weight if total_weight else 0.5
+    required_years = float(jd_data.get("required_experience_years") or 0)
+    candidate_years = float(resume_data.get("total_experience_years") or 0)
+    years_fit = min(candidate_years / required_years, 1.0) if required_years > 0 else 1.0
+    fit_score = round(100 * (0.85 * skill_fit + 0.15 * years_fit))
+
+    summary = (match_result.get("summary") or "").strip() or (
+        f"The candidate meets {len(strong_matches)} of {len(strong_matches) + len(gaps)} "
+        f"requirements, with {len(gaps)} skill gaps to close."
     )
+    return {
+        "overall_fit_score": fit_score,
+        "strong_matches": strong_matches,
+        "skill_gaps": gaps,
+        "missing_skills": missing,
+        "summary": summary,
+    }
 
-    return _parse_json_response(_get_text(response))
+
+# ---------------------------------------------------------------------------
+# Question generation and the shared question bank
+# ---------------------------------------------------------------------------
+
+QUESTION_LEVELS = ("basic", "intermediate", "advanced")
+SEVERITY_WEIGHT = {"critical": 6, "high": 5, "medium": 4, "low": 3}
+_LEVEL_MEANING = {
+    "basic": "core concepts used day to day",
+    "intermediate": "applying them in non-trivial situations",
+    "advanced": "trade-offs, edge cases and internals",
+    "expert": "deep internals and design decisions at scale",
+}
 
 
-def generate_questionnaire(
+def plan_questionnaire(skills: List[Dict], num_questions: int) -> List[Dict]:
+    """
+    Decide how many questions each skill gets, and how they split across levels.
+
+    `skills` are gap dicts ({skill, gap_severity, priority...}) in priority order.
+    Every assessed skill gets at least 3 questions (one per level); if there are
+    too many skills for that, the lowest-priority ones are left out.
+    Returns [{skill, gap_severity, counts: {basic, intermediate, advanced}}].
+    """
+    if not skills or num_questions <= 0:
+        return []
+    skills = skills[: max(1, num_questions // 3)]
+    weights = [SEVERITY_WEIGHT.get(s.get("gap_severity", "medium"), 4) for s in skills]
+
+    totals = [3] * len(skills)
+    remaining = num_questions - sum(totals)
+    if remaining > 0:
+        shares = [remaining * w / sum(weights) for w in weights]
+        extra = [int(x) for x in shares]
+        # largest remainder, ties broken by priority order
+        order = sorted(range(len(skills)), key=lambda i: shares[i] - extra[i], reverse=True)
+        for i in order[: remaining - sum(extra)]:
+            extra[i] += 1
+        totals = [t + e for t, e in zip(totals, extra)]
+
+    plan = []
+    for skill, total in zip(skills, totals):
+        base, rem = divmod(total, 3)
+        counts = {level: base for level in QUESTION_LEVELS}
+        for level in ("intermediate", "basic", "advanced")[:rem]:
+            counts[level] += 1
+        plan.append({"skill": skill["skill"], "gap_severity": skill.get("gap_severity"), "counts": counts})
+    return plan
+
+
+async def _generate_mcqs(skill: str, counts: Dict[str, int], avoid: List[str]) -> List[Tuple[str, Dict]]:
+    """One LLM call for one skill. Returns [(level, question dict)] for valid questions."""
+    wanted = {lvl: n for lvl, n in counts.items() if n > 0}
+    total = sum(wanted.values())
+    if total == 0:
+        return []
+    single_level = len(wanted) == 1
+    breakdown = ", ".join(f"{n} {lvl}" for lvl, n in wanted.items())
+    levels_text = "; ".join(f"{lvl} = {_LEVEL_MEANING[lvl]}" for lvl in wanted)
+    avoid_text = f"\nAlready covered, choose different concepts: {'; '.join(avoid)}" if avoid else ""
+
+    prompt = f"""Write exactly {total} multiple-choice questions on {skill}: {breakdown}.
+Levels: {levels_text}.
+Rules:
+- At least 60% scenario-based: a realistic situation where the reader must choose, debug or decide. Avoid pure definitions.
+- Four options A-D, all plausible, exactly one correct.
+- explanation: one sentence on why the correct answer is right.
+- concept: the sub-topic tested, 2-6 words.{avoid_text}
+Return: {{"questions":[{{"level":"basic|intermediate|advanced","question":str,"options":{{"A":str,"B":str,"C":str,"D":str}},"correct_answer":"A|B|C|D","explanation":str,"concept":str}}]}}"""
+
+    raw = await _complete_json(f"mcq:{skill}", prompt, MCQBatch, max_tokens=230 * total + 200)
+    items = raw.get("questions", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+
+    valid = []
+    for item in items:
+        try:
+            mcq = GeneratedMCQ.model_validate(item)
+        except ValidationError:
+            continue
+        options = mcq.options.model_dump()
+        if not mcq.question.strip() or len({o.strip().lower() for o in options.values()}) < 4:
+            continue
+        level = next(iter(wanted)) if single_level else mcq.level
+        valid.append((level, {
+            "question": mcq.question.strip(),
+            "options": options,
+            "correct_answer": mcq.correct_answer,
+            "explanation": mcq.explanation.strip(),
+            "concept": mcq.concept.strip(),
+        }))
+    return valid
+
+
+async def _questions_for_skill(
+    skill: str,
+    counts: Dict[str, int],
+    exclude_ids: Optional[List[str]] = None,
+) -> Dict[str, List[Dict]]:
+    """
+    Fill `counts` ({level: n}) for one skill: bank first, then generate only the
+    shortfall (one retry for anything still missing). New questions are saved
+    to the bank. Returns {level: [question dicts with bank_id]}.
+    """
+    key = skill_key(skill)
+    result: Dict[str, List[Dict]] = {}
+    seen_norms = set()
+    for level, n in counts.items():
+        result[level] = database.get_bank_questions(key, level, n, exclude_ids)
+        seen_norms.update(_question_norm(q["question"]) for q in result[level])
+
+    for attempt in range(2):
+        shortfall = {lvl: n - len(result[lvl]) for lvl, n in counts.items() if n > len(result[lvl])}
+        if not shortfall:
+            break
+        avoid = []
+        for lvl in shortfall:
+            avoid += database.get_bank_concepts(key, lvl, limit=15)
+        generated = await _generate_mcqs(skill, shortfall, avoid[:30])
+
+        by_level: Dict[str, List[Dict]] = {}
+        for level, q in generated:
+            norm = _question_norm(q["question"])
+            if norm in seen_norms:
+                continue
+            seen_norms.add(norm)
+            by_level.setdefault(level, []).append(q)
+
+        for level, qs in by_level.items():
+            ids = database.add_bank_questions(key, skill, level, qs, [_question_norm(q["question"]) for q in qs], MODEL)
+            for q, bank_id in zip(qs, ids):
+                q["bank_id"] = bank_id
+            if level in shortfall:
+                result[level].extend(qs[: shortfall[level]])
+        if attempt == 0 and shortfall:
+            log.info("Generated questions for %s (%s)", skill, shortfall)
+    return result
+
+
+def _shuffle_options(q: Dict, include_idk: bool) -> Tuple[Dict[str, str], str]:
+    """Randomise option order (fixing the model's bias toward B/C) and remap the answer."""
+    letters = ["A", "B", "C", "D"]
+    order = letters[:]
+    random.shuffle(order)
+    options = {new: q["options"][old] for new, old in zip(letters, order)}
+    correct = letters[order.index(q["correct_answer"])]
+    if include_idk:
+        options["E"] = IDK_OPTION
+    return options, correct
+
+
+async def generate_questionnaire(
     skill_gaps: Dict,
     resume_data: Dict,
     jd_data: Dict,
     num_questions: int = 30
 ) -> List[Dict]:
     """
-    Generate an adaptive MCQ questionnaire of 35-40 questions covering all skill gaps.
-    Questions are distributed across basic/intermediate/advanced levels per skill.
+    Build the assessment for all skill gaps, reusing bank questions where possible.
 
     Returns list of MCQ dicts:
-        [{id, skill, level, question, options {A/B/C/D}, correct_answer, explanation, concept}]
+        [{id, bank_id, skill, level, question, options {A-E}, correct_answer, explanation, concept}]
     """
-    gaps = skill_gaps.get("skill_gaps", [])
-    missing = skill_gaps.get("missing_skills", [])
+    skills, seen = [], set()
+    for gap in sorted(skill_gaps.get("skill_gaps", []), key=lambda g: g.get("priority", 99)):
+        if gap["skill"].lower() not in seen:
+            seen.add(gap["skill"].lower())
+            skills.append(gap)
+    for name in skill_gaps.get("missing_skills", []):  # older analyses listed these separately
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            skills.append({"skill": name, "gap_severity": "high"})
 
-    # Build a combined skills list with context
-    skills_to_assess = []
-    for gap in gaps:
-        skills_to_assess.append({
-            "skill": gap["skill"],
-            "candidate_level": gap["candidate_level"],
-            "required_level": gap["required_level"],
-            "gap_severity": gap["gap_severity"]
-        })
-    for skill in missing:
-        skills_to_assess.append({
-            "skill": skill,
-            "candidate_level": "none",
-            "required_level": "intermediate",
-            "gap_severity": "high"
-        })
-
-    prompt = f"""You are an expert technical interviewer and assessment designer. Create a comprehensive adaptive questionnaire.
-
-CANDIDATE BACKGROUND:
-- Name: {resume_data.get('candidate_name', 'Candidate')}
-- Experience: {resume_data.get('total_experience_years', 0)} years
-- Current Skills: {[s['name'] for s in resume_data.get('skills', [])]}
-
-SKILLS TO ASSESS:
-{json.dumps(skills_to_assess, indent=2)}
-
-JOB ROLE: {jd_data.get('role_title', 'Software Engineer')}
-
-Generate exactly {num_questions} multiple choice questions. Distribute questions across skills proportionally based on gap_severity (critical/high gaps get more questions). For each skill, create questions at basic, intermediate, and advanced levels.
-
-IMPORTANT: At least 60% of questions must be scenario-based / practical — present a real-world situation and ask what the candidate would do, debug, choose, or implement. Avoid pure definition or memorisation questions.
-
-Every question MUST include option E fixed as "I don't know" — do not change this text.
-
-Return ONLY a valid JSON array with this exact structure:
-[
-    {{
-        "id": 1,
-        "skill": "Machine Learning",
-        "level": "basic",
-        "question": "Your training accuracy is 98% but validation accuracy is 62%. Which action should you take first?",
-        "options": {{
-            "A": "Increase the number of training epochs",
-            "B": "Add dropout or L2 regularization to reduce overfitting",
-            "C": "Switch to a simpler loss function",
-            "D": "Collect more test data",
-            "E": "I don't know"
-        }},
-        "correct_answer": "B",
-        "explanation": "The large gap between training and validation accuracy is a classic sign of overfitting. Regularization techniques like dropout or L2 penalize model complexity and improve generalization.",
-        "concept": "Overfitting and regularization"
-    }},
-    {{
-        "id": 2,
-        "skill": "Machine Learning",
-        "level": "intermediate",
-        "question": "You are deploying a fraud-detection model where false negatives (missed fraud) are far more costly than false positives. Which metric should guide your threshold tuning?",
-        "options": {{
-            "A": "Accuracy",
-            "B": "Precision",
-            "C": "Recall",
-            "D": "F1-score",
-            "E": "I don't know"
-        }},
-        "correct_answer": "C",
-        "explanation": "Recall (true positive rate) measures how many actual fraud cases are caught. When missing fraud is very costly, maximizing recall is critical even at the expense of more false alarms.",
-        "concept": "Evaluation metrics and threshold selection"
-    }}
-]
-
-Rules:
-- id must be sequential integers starting from 1
-- level must be: basic, intermediate, or advanced
-- Each skill should have at least 3 questions (1 basic, 1 intermediate, 1 advanced)
-- High/critical severity skills should get 5-7 questions
-- Options A–D must all be plausible; option E is always exactly "I don't know"
-- correct_answer must be exactly "A", "B", "C", or "D" — never "E"
-- Frame questions as real-world tasks, debugging problems, or design decisions where possible
-- Make questions relevant to real-world {jd_data.get('role_title', 'software engineering')} scenarios
-- Return ONLY the JSON array, nothing else"""
-
-    response = _get_client().chat.completions.create(
-        model=MODEL,
-        max_tokens=32768,
-        messages=[{"role": "user", "content": prompt}]
+    plan = plan_questionnaire(skills, num_questions)
+    results = await asyncio.gather(
+        *(_questions_for_skill(p["skill"], p["counts"]) for p in plan),
+        return_exceptions=True,
     )
 
-    questions = _parse_json_response(_get_text(response))
+    questions: List[Dict] = []
+    for entry, result in zip(plan, results):
+        if isinstance(result, Exception):
+            log.warning("Question generation failed for %s: %s", entry["skill"], result)
+            continue
+        for level in QUESTION_LEVELS:
+            for q in result.get(level, []):
+                options, correct = _shuffle_options(q, include_idk=True)
+                questions.append({
+                    "id": len(questions) + 1,
+                    "bank_id": q.get("bank_id"),
+                    "skill": entry["skill"],
+                    "level": level,
+                    "question": q["question"],
+                    "options": options,
+                    "correct_answer": correct,
+                    "explanation": q.get("explanation", ""),
+                    "concept": q.get("concept", ""),
+                })
 
-    # Validate and normalize
-    if not isinstance(questions, list):
-        raise ValueError("Expected a list of questions from the model")
-
-    for i, q in enumerate(questions):
-        q["id"] = i + 1  # Ensure sequential IDs
-
+    if not questions:
+        errors = [r for r in results if isinstance(r, Exception)]
+        raise ValueError(f"Could not generate any questions: {errors[0] if errors else 'no skill gaps'}")
     return questions
 
+
+async def generate_skill_test(
+    skill_name: str,
+    target_level: str,
+    exclude_ids: Optional[List[str]] = None,
+) -> List[Dict]:
+    """
+    10 verification MCQs at the target level, skipping questions this session has
+    already seen (so a retest gets a fresh set).
+
+    Returns [{id, bank_id, question, options {A-D}, correct_answer, explanation, concept_tested}]
+    """
+    level = target_level if target_level in _LEVEL_MEANING else "intermediate"
+    result = await _questions_for_skill(skill_name, {level: SKILL_TEST_SIZE}, exclude_ids)
+    pool = result.get(level, [])
+    if not pool:
+        raise ValueError("The model failed to return any questions.")
+
+    questions = []
+    for q in pool[:SKILL_TEST_SIZE]:
+        options, correct = _shuffle_options(q, include_idk=False)
+        questions.append({
+            "id": len(questions) + 1,
+            "bank_id": q.get("bank_id"),
+            "question": q["question"],
+            "options": options,
+            "correct_answer": correct,
+            "explanation": q.get("explanation", ""),
+            "concept_tested": q.get("concept", ""),
+        })
+    return questions
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
 
 def calculate_proficiency_scores(
     questions: List[Dict],
@@ -475,179 +736,77 @@ def calculate_proficiency_scores(
     return proficiency_scores
 
 
-def generate_learning_pathway(
+# ---------------------------------------------------------------------------
+# Learning pathway
+# ---------------------------------------------------------------------------
+
+_PROVIDER_SITES = {
+    "coursera": "coursera.org", "udemy": "udemy.com", "edx": "edx.org",
+    "freecodecamp": "freecodecamp.org", "khan academy": "khanacademy.org",
+    "pluralsight": "pluralsight.com", "linkedin learning": "linkedin.com/learning",
+    "o'reilly": "oreilly.com", "oreilly": "oreilly.com", "manning": "manning.com",
+    "mdn": "developer.mozilla.org", "kaggle": "kaggle.com", "leetcode": "leetcode.com",
+    "hackerrank": "hackerrank.com", "exercism": "exercism.org", "datacamp": "datacamp.com",
+    "aws": "aws.amazon.com", "microsoft learn": "learn.microsoft.com", "google cloud": "cloud.google.com",
+}
+
+
+def resource_url(resource: Dict[str, str]) -> str:
+    """A search link for a named resource — always resolves, unlike model-written URLs."""
+    title, provider = resource.get("title", ""), resource.get("provider", "")
+    query = f"{title} {provider}".strip()
+    if resource.get("type") == "video" or "youtube" in provider.lower():
+        return "https://www.youtube.com/results?search_query=" + quote_plus(title)
+    site = next((domain for name, domain in _PROVIDER_SITES.items() if name in provider.lower()), None)
+    if site:
+        query = f"{title} site:{site}"
+    return "https://www.google.com/search?q=" + quote_plus(query)
+
+
+async def generate_learning_pathway(
     proficiency_scores: Dict,
     skill_gaps: Dict,
     resume_data: Dict,
     jd_data: Dict
 ) -> Dict[str, Any]:
-    """
-    Generate a personalized learning pathway for all skill gaps.
+    """Generate a personalised learning pathway covering every skill gap."""
+    gaps = []
+    for gap in skill_gaps.get("skill_gaps", []):
+        assessed = proficiency_scores.get(gap["skill"], {})
+        gaps.append({
+            "skill": gap["skill"],
+            "assessed_level": assessed.get("level", gap.get("candidate_level")),
+            "assessed_score": assessed.get("score"),
+            "required_level": gap.get("required_level"),
+            "severity": gap.get("gap_severity"),
+        })
 
-    Returns comprehensive JSON with learning order, resources, timelines, etc.
-    """
-    prompt = f"""You are an expert learning and development specialist and curriculum designer. Create a personalized learning pathway.
-
-CANDIDATE: {resume_data.get('candidate_name', 'Candidate')} ({resume_data.get('total_experience_years', 0)} years experience)
-
-PROFICIENCY ASSESSMENT RESULTS:
-{json.dumps(proficiency_scores, indent=2)}
-
-SKILL GAPS IDENTIFIED:
-{json.dumps(skill_gaps.get('skill_gaps', []), indent=2)}
-
-TARGET ROLE: {jd_data.get('role_title', 'Software Engineer')}
-
-Design a comprehensive, personalized learning pathway. Return ONLY a valid JSON object:
-{{
-    "total_estimated_weeks": 16,
-    "overview": "A 16-week intensive upskilling program focusing on ML engineering and cloud infrastructure, building from your strong Python foundation.",
-    "learning_order": ["Python Advanced", "Machine Learning", "Docker", "Kubernetes", "AWS"],
-    "skills": [
-        {{
-            "skill_name": "Machine Learning",
-            "current_level": "basic",
-            "target_level": "advanced",
-            "priority": "critical",
-            "estimated_weeks": 6,
-            "reasoning": "Core requirement for the role; your Python skills provide an excellent foundation to build upon",
-            "prerequisites": ["Python Advanced", "Statistics Basics"],
-            "resources": [
-                {{
-                    "type": "course",
-                    "title": "Machine Learning Specialization",
-                    "provider": "Coursera (Andrew Ng)",
-                    "url": "https://www.coursera.org/specializations/machine-learning-introduction",
-                    "estimated_hours": 60,
-                    "description": "Comprehensive ML foundations covering supervised, unsupervised, and reinforcement learning"
-                }},
-                {{
-                    "type": "book",
-                    "title": "Hands-On Machine Learning with Scikit-Learn, Keras & TensorFlow",
-                    "provider": "O'Reilly",
-                    "url": "https://www.oreilly.com/library/view/hands-on-machine-learning/9781492032632/",
-                    "estimated_hours": 40,
-                    "description": "Practical guide with real-world projects and implementations"
-                }},
-                {{
-                    "type": "practice",
-                    "title": "Kaggle ML Competitions",
-                    "provider": "Kaggle",
-                    "url": "https://www.kaggle.com/competitions",
-                    "estimated_hours": 20,
-                    "description": "Apply skills on real datasets and compete with ML practitioners"
-                }}
-            ],
-            "learning_steps": [
-                {{
-                    "week": 1,
-                    "focus": "ML Fundamentals & Math Review",
-                    "tasks": [
-                        "Complete Andrew Ng's ML course Week 1-2",
-                        "Review linear algebra and calculus basics",
-                        "Implement linear regression from scratch in Python"
-                    ],
-                    "milestone": "Understand and implement basic regression models"
-                }},
-                {{
-                    "week": 2,
-                    "focus": "Classification & Model Evaluation",
-                    "tasks": [
-                        "Study decision trees and SVMs",
-                        "Learn cross-validation and metrics (precision, recall, F1)",
-                        "Complete first Kaggle competition submission"
-                    ],
-                    "milestone": "Build and evaluate a classification pipeline"
-                }}
-            ],
-            "practice_project": "Build an end-to-end ML pipeline: data ingestion -> feature engineering -> model training -> evaluation -> FastAPI serving endpoint"
-        }}
-    ]
-}}
-
+    prompt = f"""You are a learning and development specialist. Design a learning pathway that closes every skill gap below.
+Return: {{"total_estimated_weeks":number,"overview":"2 sentences","skills":[{{"skill_name":str,"current_level":str,"target_level":"basic|intermediate|advanced|expert","priority":"critical|high|medium|low","estimated_weeks":number,"reasoning":"1 sentence","prerequisites":[str],"resources":[{{"type":"course|book|docs|video|practice|article","title":str,"provider":str}}],"learning_steps":[{{"week":"1 or 2-3","focus":str,"tasks":[str],"milestone":str}}],"practice_project":"1 sentence"}}]}}
 Rules:
-- Create an entry for EVERY skill in the skill_gaps list
-- learning_order should sequence skills optimally (foundational skills first)
-- priority: critical, high, medium, low (based on gap_severity and job requirements)
-- resources: include 3-5 diverse resources per skill (courses, books, docs, practice platforms, videos)
-- Use real, verified resources with accurate URLs
-- learning_steps: provide week-by-week breakdown for each skill
-- practice_project: suggest a hands-on project that demonstrates the skill
-- estimated_weeks should be realistic and account for the gap severity
-- Return ONLY the JSON, nothing else"""
+- One entry per skill gap, using the exact skill names given, ordered so prerequisites come first.
+- current_level = assessed_level; target_level = required_level; priority from severity.
+- resources: 3 well-known, real resources (title and provider only, no URLs).
+- learning_steps: at most 4; group weeks (e.g. "3-4") when estimated_weeks > 4; 2-3 short tasks each.
+- estimated_weeks realistic for the gap; total_estimated_weeks assumes skills are learned in order.
 
-    response = _get_client().chat.completions.create(
-        model=MODEL,
-        max_tokens=16000,
-        messages=[{"role": "user", "content": prompt}]
-    )
+ROLE: {jd_data.get('role_title', 'Software Engineer')}
+CANDIDATE: {resume_data.get('total_experience_years', 0)} years experience
+SKILL GAPS: {_compact(gaps)}"""
 
-    return _parse_json_response(_get_text(response))
+    raw = await _complete_json("pathway", prompt, Pathway, max_tokens=max(2000, 700 * len(gaps) + 300))
+    pathway = Pathway.model_validate(raw).model_dump()
+
+    for skill in pathway["skills"]:
+        for resource in skill["resources"]:
+            resource["url"] = resource_url(resource)
+    pathway["learning_order"] = [s["skill_name"] for s in pathway["skills"]]
+    return pathway
 
 
-def generate_skill_test(skill_name: str, target_level: str) -> List[Dict]:
-    """
-    Generate 10 verification MCQs for a specific skill at the target proficiency level.
-
-    Returns list of 8 MCQ dicts:
-        [{id, question, options {A/B/C/D}, correct_answer, explanation, concept_tested}]
-    """
-    prompt = f"""You are an expert technical examiner. Create a rigorous verification test for the skill: {skill_name}
-
-TARGET PROFICIENCY LEVEL: {target_level}
-
-Generate exactly 10 multiple choice questions that verify {target_level}-level competency in {skill_name}.
-Questions should progressively increase in difficulty within the {target_level} range.
-
-Return ONLY a valid JSON array:
-[
-    {{
-        "id": 1,
-        "question": "You have a dataset with 1 million rows and 500 features. Many features are highly correlated. Which dimensionality reduction technique would be most appropriate as a preprocessing step before training an SVM classifier?",
-        "options": {{
-            "A": "Feature selection using chi-squared test",
-            "B": "Principal Component Analysis (PCA) to reduce to top 50 components",
-            "C": "Random feature sampling",
-            "D": "One-hot encoding all features"
-        }},
-        "correct_answer": "B",
-        "explanation": "PCA is ideal here: it handles correlated features by transforming them into uncorrelated principal components, dramatically reducing dimensionality while preserving maximum variance. SVMs are particularly sensitive to high-dimensional sparse spaces, making PCA preprocessing critical for performance.",
-        "concept_tested": "Dimensionality reduction and preprocessing for SVMs"
-    }}
-]
-
-Rules:
-- All 10 questions must test {target_level}-level knowledge of {skill_name}
-- Questions should test PRACTICAL application, not just memorization
-- Include scenario-based questions where appropriate
-- All 4 options must be plausible to an intermediate learner
-- correct_answer must be exactly "A", "B", "C", or "D"
-- explanations must be detailed and educational (explain WHY the answer is correct)
-- concept_tested should identify the specific sub-topic or concept
-- Return ONLY the JSON array, nothing else"""
-
-    questions = []
-    for attempt in range(3):
-        response = _get_client().chat.completions.create(
-            model=MODEL,
-            max_tokens=16000,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        parsed = _parse_json_response(_get_text(response))
-        if isinstance(parsed, list) and len(parsed) >= questions.__len__():
-            questions = parsed
-        if len(questions) >= 10:
-            break
-
-    if not questions:
-        raise ValueError("Model failed to return any questions after 3 attempts.")
-
-    # Ensure sequential IDs
-    for i, q in enumerate(questions):
-        q["id"] = i + 1
-
-    return questions[:10]
-
+# ---------------------------------------------------------------------------
+# Skill test evaluation
+# ---------------------------------------------------------------------------
 
 def evaluate_skill_test(
     skill_name: str,
@@ -656,26 +815,11 @@ def evaluate_skill_test(
     target_level: str
 ) -> Dict[str, Any]:
     """
-    Evaluate a completed skill test and generate detailed feedback.
-
-    Args:
-        skill_name: name of the skill being tested
-        questions: the 8 MCQ dicts
-        answers: {str(question_id): letter} mapping
-        target_level: the target proficiency level
+    Score a completed skill test and build feedback (no LLM call).
 
     Returns:
-        {
-            score: float (0-100),
-            correct: int,
-            total: int,
-            passed: bool (score >= 75),
-            wrong_answers: [{question, your_answer, correct_answer, explanation}],
-            feedback: str,
-            areas_to_review: [str]
-        }
+        {score, correct, total, passed, wrong_answers: [...], feedback, areas_to_review}
     """
-    # Calculate score
     correct_count = 0
     wrong_answers = []
 
@@ -697,38 +841,11 @@ def evaluate_skill_test(
 
     total = len(questions)
     score = round((correct_count / total) * 100) if total > 0 else 0
-    passed = score >= 75
+    passed = score >= SKILL_TEST_PASS_MARK
 
-    # Extract areas to review from wrong answers
-    areas_to_review = list(set(
-        wa.get("concept", "") for wa in wrong_answers if wa.get("concept")
+    areas_to_review = list(dict.fromkeys(
+        wa["concept"] for wa in wrong_answers if wa.get("concept")
     ))
-
-    # Generate personalized feedback
-    feedback_prompt = f"""You are an expert learning coach. A candidate just completed a verification test.
-
-TEST RESULTS:
-- Skill: {skill_name}
-- Target Level: {target_level}
-- Score: {score}% ({correct_count}/{total} correct)
-- Status: {"PASSED" if passed else "FAILED"}
-- Areas needing improvement: {areas_to_review}
-
-Write a brief, encouraging, and actionable feedback message (3-5 sentences) that:
-1. Acknowledges their performance specifically
-2. If passed: celebrates achievement and suggests next steps
-3. If failed: identifies what to focus on and how to improve
-4. Is warm, professional, and motivating
-
-Return ONLY the feedback text, no JSON, no formatting."""
-
-    feedback_response = _get_client().chat.completions.create(
-        model=MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": feedback_prompt}]
-    )
-
-    feedback_text = _get_text(feedback_response).strip()
 
     return {
         "score": score,
@@ -736,6 +853,21 @@ Return ONLY the feedback text, no JSON, no formatting."""
         "total": total,
         "passed": passed,
         "wrong_answers": wrong_answers,
-        "feedback": feedback_text,
+        "feedback": _feedback(skill_name, target_level, score, correct_count, total, passed, areas_to_review),
         "areas_to_review": areas_to_review
     }
+
+
+def _feedback(skill: str, level: str, score: int, correct: int, total: int,
+              passed: bool, areas: List[str]) -> str:
+    focus = ", ".join(areas[:3])
+    if passed:
+        text = f"Well done: you scored {score}% ({correct}/{total}) and passed the {level} {skill} check. "
+        text += (f"To round things off, revisit {focus}. " if focus
+                 else "You answered every question correctly. ")
+        return text + "You're ready to move on to the next skill in your pathway."
+    text = f"You scored {score}% ({correct}/{total}); the pass mark is {SKILL_TEST_PASS_MARK}%. "
+    if focus:
+        text += f"Focus on {focus}. "
+    return text + ("Read the explanations below, work through this skill's resources in your pathway, "
+                   "then retake the test. You'll get a fresh set of questions.")

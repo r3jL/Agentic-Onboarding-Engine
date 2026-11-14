@@ -1,6 +1,6 @@
 # AI Onboarding Engine
 
-> An adaptive, AI-powered employee onboarding platform that analyzes skill gaps, generates personalized assessments, and creates customized learning pathways — powered by Ollama (Qwen2.5:7b) running entirely offline.
+> An adaptive, AI-powered employee onboarding platform that analyzes skill gaps, generates personalized assessments, and creates customized learning pathways — powered by any OpenAI-compatible LLM — run it fully offline with Ollama (Qwen2.5:7b), or point it at a hosted API (Groq, Gemini, OpenRouter) for cloud deployment.
 
 ---
 
@@ -29,13 +29,14 @@
              ┌─────────────┴──────────────┐
              ▼                            ▼
 ┌────────────────────┐   ┌────────────────────────────────────────┐
-│   SQLite DB        │   │   Ollama (ai_engine.py)                │
-│   (database.py)    │   │   Model: qwen2.5:7b                    │
+│   SQLite DB        │   │   LLM via OpenAI API (ai_engine.py)    │
+│   (database.py)    │   │   Ollama (default) or hosted provider  │
 │                    │   │                                        │
 │  sessions          │   │  parse_resume()                        │
 │  skill_tests       │   │  parse_job_description()               │
 │  managers          │   │  analyze_skill_gap()                   │
-│  manager_sessions  │   │  generate_questionnaire()              │
+│  manager_sessions  │
+│  question_bank     │   │  generate_questionnaire()              │
 │                    │   │  calculate_proficiency_scores()        │
 │                    │   │  generate_learning_pathway()           │
 │                    │   │  generate_skill_test()                 │
@@ -49,10 +50,10 @@
 
 | Layer | Technology |
 |-------|-----------|
-| AI Model | **Qwen2.5:7b** via **Ollama** (runs fully offline, no API key needed) |
+| AI Model | **Qwen2.5:7b** via **Ollama** by default (fully offline), or any OpenAI-compatible API (Groq, Gemini, OpenRouter…) |
 | Backend | **FastAPI** (Python 3.11+) |
 | Database | **SQLite** via Python's built-in `sqlite3` |
-| PDF Parsing | **pdfplumber** |
+| PDF Parsing | **pdfplumber** (column-aware extraction) |
 | Auth | **Firebase Authentication** (Google sign-in + email/password) |
 | Frontend | **Vanilla JavaScript** + **Tailwind CSS** (CDN) + **Font Awesome 6** |
 | Serving | **Uvicorn** ASGI server |
@@ -126,9 +127,10 @@ App will be available at `http://localhost:8000`.
 
 When a candidate submits their resume and a job description:
 
-1. **Resume Parsing** — extracts skills with proficiency levels, work experience, education
-2. **JD Parsing** — extracts required skills with importance levels (required / preferred / nice_to_have)
-3. **Gap Analysis** — produces:
+1. **Resume Verification** — before anything is sent to the LLM, the file is checked (PDF or .txt, ≤ 5 MB, ≤ 10 pages, readable text) and scored for résumé signals: contact details, section headings, employment dates; invoices, papers and data tables are rejected with a clear message. Only then is the text trimmed (first 5 pages, ~12k characters). The parse step makes a final "is this a résumé?" check.
+2. **Resume Parsing** — extracts skills with proficiency levels, work experience, education
+3. **JD Parsing** — extracts required skills with importance levels (required / preferred / nice_to_have)
+4. **Gap Analysis** — the LLM only matches résumé skills to job skills (e.g. *Postgres* → *PostgreSQL*); severity, priority and the fit score are computed in Python, so results are consistent. It produces:
    - **Overall Fit Score** (0–100)
    - **Strong Matches** — skills where candidate meets or exceeds requirements
    - **Skill Gaps** — per-skill severity (critical / high / medium / low) with reasoning
@@ -136,9 +138,10 @@ When a candidate submits their resume and a job description:
 
 ### 2. Adaptive Questionnaire
 
-- **35–40 MCQ questions** across all gap skills
-- Three difficulty levels: basic, intermediate, advanced
-- Critical/high gaps get more questions (5–7); medium/low get fewer (3–4)
+- **10–50 MCQ questions** (default 30) across all gap skills, at basic, intermediate and advanced levels
+- Questions are allotted in Python by gap severity (critical/high gaps get more; every skill gets at least 3)
+- Questions come from a shared **question bank**: each (skill, level) is generated once — one LLM call per skill, in parallel — and reused for later candidates
+- Option order is shuffled per candidate; answer keys never reach the browser before submission
 - Scoring: basic=1x, intermediate=2x, advanced=3x weight
 
 ### 3. Proficiency Score Calculation
@@ -156,15 +159,15 @@ Level:  ≥85% → advanced
 
 - Learning order optimized for prerequisites (foundational skills first)
 - Week-by-week breakdown with specific tasks and milestones
-- Practice project per skill
+- Practice project and 3 resources per skill (links are search URLs, so they never 404)
 - Estimated timeline based on gap severity
 
 ### 5. Skill Verification Tests
 
-- 8 scenario-based MCQs per skill at the target proficiency level
-- Pass threshold: 75% (6/8 correct)
-- Personalized feedback on wrong answers
-- Failed skills enter "needs_revision" and can be retested
+- 10 scenario-based MCQs per skill at the target proficiency level, drawn from the question bank
+- Pass threshold: 75% (8/10 correct)
+- Explanations for every wrong answer, plus feedback on the concepts to review
+- Failed skills enter "needs_revision" and can be retested with a fresh set of questions
 
 ---
 
@@ -181,6 +184,7 @@ Level:  ≥85% → advanced
 | POST | `/api/sessions/{id}/analyze` | Run skill gap analysis |
 | POST | `/api/sessions/{id}/questionnaire/generate` | Generate MCQs |
 | POST | `/api/sessions/{id}/questionnaire/answer` | Submit one answer |
+| POST | `/api/sessions/{id}/questionnaire/answers` | Submit all answers at once |
 | POST | `/api/sessions/{id}/questionnaire/finish` | Calculate proficiency scores |
 | POST | `/api/sessions/{id}/pathway/generate` | Generate learning pathway |
 | GET | `/api/sessions/{id}/pathway` | Get pathway + skill progress |
@@ -215,6 +219,43 @@ Level:  ≥85% → advanced
 |----------|----------|-------------|
 | `ADMIN_PASSWORD` | Yes | Password for the `/admin.html` page |
 | `DB_PATH` | No | SQLite file path (default: `onboarding.db`, set to `/app/data/onboarding.db` in Docker) |
+| `LLM_BASE_URL` | No | OpenAI-compatible API base URL (default: `http://localhost:11434/v1`, i.e. local Ollama) |
+| `LLM_API_KEY` | No | API key for the provider (ignored by Ollama) |
+| `LLM_MODEL` | No | Model name (default: `qwen2.5:7b`) |
+| `LLM_MAX_TOKENS` | No | Upper bound on `max_tokens` per request, for providers with lower output limits |
+| `LLM_REASONING_BUDGET` | No | Extra tokens added to every request when using a reasoning model, whose hidden thinking counts against `max_tokens` (default `0`). A non-reasoning model is cheaper and faster for this app. |
+| `LLM_CONCURRENCY` | No | Max LLM requests in flight at once (default: `4`; lower it for strict free tiers) |
+| `LLM_JSON_SCHEMA` | No | Set `false` if the provider rejects `response_format` JSON schemas (detected automatically otherwise) |
+| `LLM_TIMEOUT` / `LLM_MAX_RETRIES` | No | Request timeout in seconds (default `600`) / retries on rate limits and server errors, with 2s → 8s → 20s → 45s backoff or the provider's `retry-after` (default `4`) |
+| `PORT` | No | Port to listen on (default: `8000`; most hosts set this automatically) |
+
+LLM token usage is logged per call (`LLM <step>: N prompt + M completion tokens`).
+
+---
+
+## Deploying online (hosted LLM)
+
+Ollama needs several GB of RAM and ideally a GPU, which free hosting tiers don't provide. For a public deployment, use a hosted LLM API instead — no code changes needed:
+
+1. Get an API key from an OpenAI-compatible provider (see the examples in `.env.example`).
+2. Deploy the repo's `Dockerfile` to a container host. The default build skips Ollama, so the image stays small.
+3. Set `ADMIN_PASSWORD`, `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` as environment variables on the host.
+4. Add the deployed domain to **Firebase → Authentication → Settings → Authorized domains**, or sign-in will fail.
+
+`start.sh` skips Ollama automatically whenever `LLM_BASE_URL` isn't a localhost address.
+
+> **Note:** SQLite lives on the container's disk. On hosts without a persistent volume, data (sessions, the manager whitelist and the question bank) resets when the container restarts or redeploys.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+The tests use a fake LLM, so they run offline in about a second.
 
 ---
 
@@ -225,13 +266,17 @@ hecklers/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py           # FastAPI application + all API endpoints
-│   ├── ai_engine.py      # Ollama AI integration (all AI functions)
-│   └── database.py       # SQLite operations (init, CRUD)
+│   ├── ai_engine.py      # LLM integration, question bank, gap scoring
+│   ├── resume_intake.py  # Résumé file checks, extraction, verification, trimming
+│   ├── schemas.py        # Pydantic models for structured LLM output
+│   └── database.py       # SQLite operations (init, CRUD, question bank)
 ├── static/
 │   ├── index.html        # Employee onboarding SPA
 │   ├── manager.html      # Manager dashboard
 │   └── admin.html        # Admin panel
+├── tests/                # pytest suite (fake LLM, no network)
 ├── requirements.txt      # Python dependencies
+├── requirements-dev.txt  # + test dependencies
 ├── start.sh              # One-command local startup script
 ├── Dockerfile            # Docker image definition
 ├── docker-compose.yml    # Docker Compose with persistent volumes

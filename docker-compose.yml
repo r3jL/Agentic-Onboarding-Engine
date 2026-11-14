@@ -1,6 +1,9 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        WITH_OLLAMA: "true"   # set to "false" if .env points LLM_BASE_URL at a hosted provider
     ports:
       - "8000:8000"
     env_file:

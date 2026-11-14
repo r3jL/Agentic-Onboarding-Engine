@@ -4,6 +4,7 @@ database.py - SQLite database operations for the AI Onboarding Engine.
 Tables:
   - sessions: stores all candidate/session data including resume, JD, skill gaps, questionnaire, pathway
   - skill_tests: stores per-skill verification test data and results
+  - question_bank: generated MCQs shared across sessions (cuts repeat LLM calls)
 """
 
 import os
@@ -11,11 +12,14 @@ import sqlite3
 import json
 import uuid
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
 
 # Path to the SQLite database file
 DB_PATH = os.environ.get("DB_PATH", "onboarding.db")
+
+# skill_tests columns stored as JSON text
+_SKILL_TEST_JSON_FIELDS = ("questions", "answers", "seen_question_ids")
 
 
 def get_connection() -> sqlite3.Connection:
@@ -57,12 +61,12 @@ def init_db():
                 session_id TEXT NOT NULL,
                 skill_name TEXT NOT NULL,
                 status TEXT DEFAULT 'not_started',  -- not_started/learning/testing/completed/needs_revision
-                questions TEXT,            -- JSON: list of 8 MCQ dicts
+                questions TEXT,            -- JSON: list of 10 MCQ dicts
                 answers TEXT,              -- JSON: {q_id: letter}
                 score REAL DEFAULT 0,
                 passed INTEGER DEFAULT 0,  -- 0 or 1
                 attempts INTEGER DEFAULT 0,
-                feedback TEXT,             -- text feedback from Claude
+                feedback TEXT,             -- templated feedback text
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
         """)
@@ -112,6 +116,33 @@ def init_db():
                 FOREIGN KEY (manager_id) REFERENCES managers(id)
             )
         """)
+
+        # Shared question bank: generated MCQs are reused across sessions so each
+        # (skill, level) only costs LLM tokens until the bank has enough questions.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS question_bank (
+                id TEXT PRIMARY KEY,
+                skill_key TEXT NOT NULL,     -- normalised skill name (see ai_engine.skill_key)
+                skill_name TEXT NOT NULL,    -- display name as first generated
+                level TEXT NOT NULL,         -- basic / intermediate / advanced / expert
+                question TEXT NOT NULL,      -- JSON: {question, options{A-D}, correct_answer, explanation, concept}
+                question_norm TEXT NOT NULL, -- normalised question text, for de-duplication
+                model TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_question_bank_skill_level ON question_bank (skill_key, level)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_question_bank_dedupe ON question_bank (skill_key, question_norm)"
+        )
+
+        # Bank question ids a session has already seen in a skill test, so retests differ
+        try:
+            cursor.execute("ALTER TABLE skill_tests ADD COLUMN seen_question_ids TEXT")
+        except sqlite3.OperationalError:
+            pass
 
         conn.commit()
         print("Database initialized successfully.")
@@ -228,7 +259,7 @@ def get_skill_test(session_id: str, skill_name: str) -> Optional[Dict[str, Any]]
 
         test = dict(row)
         # Parse JSON fields
-        for field in ["questions", "answers"]:
+        for field in _SKILL_TEST_JSON_FIELDS:
             if test.get(field):
                 try:
                     test[field] = json.loads(test[field])
@@ -256,7 +287,7 @@ def upsert_skill_test(session_id: str, skill_name: str, updates: Dict[str, Any])
         # Serialize JSON fields
         serialized = {}
         for key, value in updates.items():
-            if key in {"questions", "answers"} and value is not None and not isinstance(value, str):
+            if key in _SKILL_TEST_JSON_FIELDS and value is not None and not isinstance(value, str):
                 serialized[key] = json.dumps(value)
             else:
                 serialized[key] = value
@@ -300,7 +331,7 @@ def get_all_skill_tests(session_id: str) -> list:
         tests = []
         for row in rows:
             test = dict(row)
-            for field in ["questions", "answers"]:
+            for field in _SKILL_TEST_JSON_FIELDS:
                 if test.get(field):
                     try:
                         test[field] = json.loads(test[field])
@@ -312,6 +343,102 @@ def get_all_skill_tests(session_id: str) -> list:
         return tests
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Question bank
+# ---------------------------------------------------------------------------
+
+def get_bank_questions(
+    skill_key: str,
+    level: str,
+    limit: int,
+    exclude_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return up to `limit` random bank questions for (skill_key, level),
+    skipping any ids in `exclude_ids`. Each item is the stored question dict
+    plus `bank_id`.
+    """
+    if limit <= 0:
+        return []
+    exclude_ids = list(exclude_ids or [])
+    sql = "SELECT id, question FROM question_bank WHERE skill_key = ? AND level = ?"
+    params: List[Any] = [skill_key, level]
+    if exclude_ids:
+        sql += f" AND id NOT IN ({', '.join('?' for _ in exclude_ids)})"
+        params += exclude_ids
+    sql += " ORDER BY RANDOM() LIMIT ?"
+    params.append(limit)
+
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+    questions = []
+    for row in rows:
+        try:
+            q = json.loads(row["question"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        q["bank_id"] = row["id"]
+        questions.append(q)
+    return questions
+
+
+def get_bank_concepts(skill_key: str, level: str, limit: int = 30) -> List[str]:
+    """Concepts already covered for (skill_key, level), so new questions avoid repeats."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT question FROM question_bank WHERE skill_key = ? AND level = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (skill_key, level, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    concepts = []
+    for row in rows:
+        try:
+            concept = json.loads(row["question"]).get("concept")
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            continue
+        if concept and concept not in concepts:
+            concepts.append(concept)
+    return concepts
+
+
+def add_bank_questions(
+    skill_key: str,
+    skill_name: str,
+    level: str,
+    questions: List[Dict[str, Any]],
+    question_norms: List[str],
+    model: str,
+) -> List[Optional[str]]:
+    """
+    Insert questions into the bank. Duplicates (same skill_key + normalised text)
+    are skipped. Returns the new bank id for each question, or None if skipped.
+    """
+    created_at = datetime.utcnow().isoformat()
+    ids: List[Optional[str]] = []
+    conn = get_connection()
+    try:
+        for q, norm in zip(questions, question_norms):
+            qid = str(uuid.uuid4())
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO question_bank "
+                "(id, skill_key, skill_name, level, question, question_norm, model, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (qid, skill_key, skill_name, level, json.dumps(q), norm, model, created_at),
+            )
+            ids.append(qid if cur.rowcount else None)
+        conn.commit()
+    finally:
+        conn.close()
+    return ids
 
 
 import secrets

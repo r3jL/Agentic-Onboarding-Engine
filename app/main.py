@@ -1,5 +1,5 @@
 """
-app.py - FastAPI backend for the AI Onboarding Engine.
+main.py - FastAPI backend for the AI Onboarding Engine.
 
 Endpoints:
   POST /api/sessions                          - create a new session
@@ -10,6 +10,7 @@ Endpoints:
   POST /api/sessions/{id}/analyze             - run skill gap analysis
   POST /api/sessions/{id}/questionnaire/generate   - generate MCQ questionnaire
   POST /api/sessions/{id}/questionnaire/answer     - submit one answer
+  POST /api/sessions/{id}/questionnaire/answers    - submit all answers at once
   POST /api/sessions/{id}/questionnaire/finish     - finish and score questionnaire
   POST /api/sessions/{id}/pathway/generate    - generate learning pathway
   GET  /api/sessions/{id}/pathway             - get pathway + skill progress
@@ -23,12 +24,13 @@ Endpoints:
   GET  /api/manager/dashboard                 - get all employee data (manager only)
 """
 
-import io
+import hashlib
+import json
+import logging
 import os
 import secrets
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
-import pdfplumber
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,8 +38,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app import ai_engine, database
+from app.resume_intake import ResumeRejected, prepare_from_text, prepare_from_upload, MAX_FILE_BYTES
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+MAX_JD_CHARS = 15_000  # job descriptions longer than this are trimmed before parsing
 
 # ---------------------------------------------------------------------------
 # Admin session store (in-memory — single admin, no DB needed)
@@ -49,6 +55,42 @@ def _require_admin(request: Request):
     token = request.headers.get("X-Admin-Token", "")
     if not token or token not in _admin_sessions:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _public_question(q: Dict[str, Any]) -> Dict[str, Any]:
+    """Question as sent to the browser: no answer key or explanation before submission."""
+    return {k: v for k, v in q.items() if k not in ("correct_answer", "explanation")}
+
+
+def _fingerprint(*parts: Any) -> str:
+    """Short hash of the inputs a generated result depends on."""
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _questionnaire_correct(session: Dict[str, Any]) -> int:
+    answers = (session.get("questionnaire_state") or {}).get("answers", {})
+    return sum(
+        1 for q in session.get("questionnaire_questions") or []
+        if answers.get(str(q["id"])) == q.get("correct_answer")
+    )
+
+
+def _record_answers(state: Dict[str, Any], questions: List[Dict], answers: Dict[str, str]):
+    """Validate and store answers. An answer can't be changed once recorded."""
+    ids = {str(q["id"]) for q in questions}
+    for qid, letter in answers.items():
+        if qid not in ids:
+            raise HTTPException(status_code=404, detail=f"Question {qid} not found")
+        if letter not in ("A", "B", "C", "D", "E"):
+            raise HTTPException(status_code=400, detail="Answer must be A, B, C, D, or E")
+        previous = state["answers"].get(qid)
+        if previous is not None and previous != letter:
+            raise HTTPException(status_code=409, detail=f"Question {qid} has already been answered")
+        state["answers"][qid] = letter
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +129,15 @@ class TextInput(BaseModel):
 
 class AnswerInput(BaseModel):
     question_id: int
-    answer: str  # "A", "B", "C", or "D"
+    answer: str  # "A", "B", "C", "D" or "E"
+
+
+class AnswersBatchInput(BaseModel):
+    answers: Dict[str, str]  # {str(question_id): letter}
+
+
+class PathwayGenerateRequest(BaseModel):
+    regenerate: bool = False
 
 
 class TestAnswersInput(BaseModel):
@@ -127,6 +177,9 @@ async def get_session(session_id: str):
     session = database.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    session["questionnaire_correct"] = _questionnaire_correct(session)
+    if session.get("questionnaire_questions"):
+        session["questionnaire_questions"] = [_public_question(q) for q in session["questionnaire_questions"]]
     return session
 
 
@@ -134,9 +187,21 @@ async def get_session(session_id: str):
 # Resume endpoints
 # ---------------------------------------------------------------------------
 
+async def _parse_resume_or_reject(resume_text: str) -> Dict[str, Any]:
+    """Parse with the LLM; reject (422) if the model judges it isn't a résumé."""
+    try:
+        resume_data = await ai_engine.parse_resume(resume_text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse resume: {str(e)}")
+    if not resume_data.get("is_resume", True):
+        reason = resume_data.get("not_resume_reason") or "it doesn't contain a work history, education or skills"
+        raise HTTPException(status_code=422, detail=f"This doesn't look like a résumé ({reason.rstrip('.')}).")
+    return resume_data
+
+
 @app.post("/api/sessions/{session_id}/resume/text")
 async def upload_resume_text(session_id: str, body: TextInput):
-    """Parse resume from pasted text using Claude AI."""
+    """Verify, trim and parse a résumé pasted as text."""
     session = database.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -145,12 +210,14 @@ async def upload_resume_text(session_id: str, body: TextInput):
         raise HTTPException(status_code=400, detail="Resume text cannot be empty")
 
     try:
-        resume_data = ai_engine.parse_resume(body.text)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse resume: {str(e)}")
+        resume_text = prepare_from_text(body.text)
+    except ResumeRejected as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    resume_data = await _parse_resume_or_reject(resume_text)
 
     database.update_session(session_id, {
-        "resume_text": body.text,
+        "resume_text": resume_text,
         "resume_data": resume_data,
         "candidate_name": resume_data.get("candidate_name", ""),
         "status": "resume_uploaded"
@@ -161,44 +228,19 @@ async def upload_resume_text(session_id: str, body: TextInput):
 
 @app.post("/api/sessions/{session_id}/resume/file")
 async def upload_resume_file(session_id: str, file: UploadFile = File(...)):
-    """Parse resume from uploaded PDF or text file using Claude AI."""
+    """Verify, trim and parse an uploaded résumé (PDF or .txt)."""
     session = database.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    content = await file.read()
-    filename = file.filename or ""
-
-    # Extract text from PDF or plain text
-    resume_text = ""
-    if filename.lower().endswith(".pdf"):
-        try:
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                pages_text = []
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        pages_text.append(page_text)
-                resume_text = "\n".join(pages_text)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to extract PDF text: {str(e)}")
-    else:
-        # Assume plain text (txt, doc, etc.)
-        try:
-            resume_text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                resume_text = content.decode("latin-1")
-            except Exception:
-                raise HTTPException(status_code=400, detail="Could not decode file. Please use PDF or UTF-8 text.")
-
-    if not resume_text.strip():
-        raise HTTPException(status_code=400, detail="Could not extract text from file")
-
+    # Read one byte past the limit so oversized uploads are detected without reading them fully
+    content = await file.read(MAX_FILE_BYTES + 1)
     try:
-        resume_data = ai_engine.parse_resume(resume_text)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse resume: {str(e)}")
+        resume_text = prepare_from_upload(content, file.filename or "")
+    except ResumeRejected as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    resume_data = await _parse_resume_or_reject(resume_text)
 
     database.update_session(session_id, {
         "resume_text": resume_text,
@@ -216,7 +258,7 @@ async def upload_resume_file(session_id: str, file: UploadFile = File(...)):
 
 @app.post("/api/sessions/{session_id}/jd")
 async def upload_jd(session_id: str, body: TextInput):
-    """Parse job description using Claude AI."""
+    """Parse a job description."""
     session = database.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -225,7 +267,7 @@ async def upload_jd(session_id: str, body: TextInput):
         raise HTTPException(status_code=400, detail="Job description cannot be empty")
 
     try:
-        jd_data = ai_engine.parse_job_description(body.text)
+        jd_data = await ai_engine.parse_job_description(body.text[:MAX_JD_CHARS])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse job description: {str(e)}")
 
@@ -255,7 +297,7 @@ async def analyze_skill_gap(session_id: str):
         raise HTTPException(status_code=400, detail="Job description not uploaded yet")
 
     try:
-        skill_gaps = ai_engine.analyze_skill_gap(
+        skill_gaps = await ai_engine.analyze_skill_gap(
             session["resume_data"],
             session["jd_data"]
         )
@@ -276,6 +318,7 @@ async def analyze_skill_gap(session_id: str):
 
 class QuestionnaireGenerateRequest(BaseModel):
     num_questions: int = 30
+    regenerate: bool = False
 
 @app.post("/api/sessions/{session_id}/questionnaire/generate")
 async def generate_questionnaire(session_id: str, body: QuestionnaireGenerateRequest = QuestionnaireGenerateRequest()):
@@ -288,35 +331,42 @@ async def generate_questionnaire(session_id: str, body: QuestionnaireGenerateReq
     if not session.get("skill_gaps"):
         raise HTTPException(status_code=400, detail="Skill gap analysis not completed yet")
 
-    try:
-        questions = ai_engine.generate_questionnaire(
-            session["skill_gaps"],
-            session["resume_data"],
-            session["jd_data"],
-            num_questions=num_questions
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate questionnaire: {str(e)}")
-
-    # Initialize questionnaire state
-    questionnaire_state = {
-        "answers": {},        # {str(question_id): letter}
-        "current_index": 0,   # index into questions list
-        "completed": False
-    }
+    # Reuse an unfinished questionnaire built from the same analysis and size
+    source = _fingerprint(session["skill_gaps"], num_questions)
+    existing = session.get("questionnaire_questions")
+    state = session.get("questionnaire_state") or {}
+    if existing and not body.regenerate and state.get("source") == source and not state.get("completed"):
+        questions = existing
+    else:
+        try:
+            questions = await ai_engine.generate_questionnaire(
+                session["skill_gaps"],
+                session["resume_data"],
+                session["jd_data"],
+                num_questions=num_questions
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to generate questionnaire: {str(e)}")
+        state = {
+            "answers": {},        # {str(question_id): letter}
+            "current_index": 0,   # index into questions list
+            "completed": False,
+            "source": source,     # fingerprint of the inputs, for reuse
+        }
 
     database.update_session(session_id, {
         "questionnaire_questions": questions,
-        "questionnaire_state": questionnaire_state,
+        "questionnaire_state": state,
         "status": "questionnaire"
     })
 
     # Identify all unique skills being assessed
     skills_assessed = list(set(q["skill"] for q in questions))
 
+    public = [_public_question(q) for q in questions]
     return {
-        "questions": questions,
-        "first_question": questions[0] if questions else None,
+        "questions": public,
+        "first_question": public[0] if public else None,
         "total_questions": len(questions),
         "skills_being_assessed": skills_assessed
     }
@@ -344,12 +394,8 @@ async def submit_answer(session_id: str, body: AnswerInput):
     if not question:
         raise HTTPException(status_code=404, detail=f"Question {q_id} not found")
 
-    # Validate answer
-    if body.answer not in ["A", "B", "C", "D", "E"]:
-        raise HTTPException(status_code=400, detail="Answer must be A, B, C, D, or E")
-
-    # Record the answer
-    state["answers"][str(q_id)] = body.answer
+    # Validate and record the answer (answers can't be changed once recorded)
+    _record_answers(state, questions, {str(q_id): body.answer})
 
     # Determine correctness
     correct_answer = question.get("correct_answer", "")
@@ -382,7 +428,7 @@ async def submit_answer(session_id: str, body: AnswerInput):
         "is_correct": is_correct,
         "correct_answer": correct_answer,
         "explanation": question.get("explanation", ""),
-        "next_question": next_question,
+        "next_question": _public_question(next_question) if next_question else None,
         "progress": {
             "answered": answered_count,
             "total": total_count,
@@ -390,6 +436,25 @@ async def submit_answer(session_id: str, body: AnswerInput):
             "completed": state["completed"]
         }
     }
+
+
+@app.post("/api/sessions/{session_id}/questionnaire/answers")
+async def submit_answers(session_id: str, body: AnswersBatchInput):
+    """Submit all questionnaire answers in one request."""
+    session = database.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    questions = session.get("questionnaire_questions")
+    state = session.get("questionnaire_state")
+    if not questions or not state:
+        raise HTTPException(status_code=400, detail="Questionnaire not started yet")
+
+    _record_answers(state, questions, body.answers)
+    state["completed"] = True
+    database.update_session(session_id, {"questionnaire_state": state})
+
+    return {"answered": len(state["answers"]), "total": len(questions)}
 
 
 @app.post("/api/sessions/{session_id}/questionnaire/finish")
@@ -422,7 +487,7 @@ async def finish_questionnaire(session_id: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/sessions/{session_id}/pathway/generate")
-async def generate_pathway(session_id: str):
+async def generate_pathway(session_id: str, body: PathwayGenerateRequest = PathwayGenerateRequest()):
     """Generate personalized learning pathway and initialize skill tests."""
     session = database.get_session(session_id)
     if not session:
@@ -431,8 +496,14 @@ async def generate_pathway(session_id: str):
     if not session.get("proficiency_scores"):
         raise HTTPException(status_code=400, detail="Proficiency scores not calculated yet")
 
+    # Reuse the stored pathway if its inputs haven't changed
+    source = _fingerprint(session["proficiency_scores"], session["skill_gaps"])
+    existing = session.get("pathway")
+    if existing and not body.regenerate and existing.get("_source") == source:
+        return {"pathway": existing}
+
     try:
-        pathway = ai_engine.generate_learning_pathway(
+        pathway = await ai_engine.generate_learning_pathway(
             session["proficiency_scores"],
             session["skill_gaps"],
             session["resume_data"],
@@ -440,11 +511,12 @@ async def generate_pathway(session_id: str):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate pathway: {str(e)}")
+    pathway["_source"] = source
 
-    # Initialize skill test records for each skill in the pathway
+    # Create skill test records for new skills; keep progress on existing ones
     for skill_entry in pathway.get("skills", []):
         skill_name = skill_entry.get("skill_name", "")
-        if skill_name:
+        if skill_name and not database.get_skill_test(session_id, skill_name):
             database.upsert_skill_test(session_id, skill_name, {
                 "status": "not_started",
                 "questions": None,
@@ -511,21 +583,32 @@ async def generate_skill_test(session_id: str, skill_name: str):
             target_level = skill_entry.get("target_level", "intermediate")
             break
 
-    try:
-        questions = ai_engine.generate_skill_test(skill_name, target_level)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate skill test: {str(e)}")
+    # An unanswered test that's already been generated is returned as-is
+    skill_test = database.get_skill_test(session_id, skill_name) or {}
+    if skill_test.get("status") == "testing" and skill_test.get("questions") and not skill_test.get("answers"):
+        questions = skill_test["questions"]
+    else:
+        # Skip questions this session has already seen, so a retest is fresh
+        seen = list(skill_test.get("seen_question_ids") or [])
+        seen += [q.get("bank_id") for q in skill_test.get("questions") or []]
+        seen += [q.get("bank_id") for q in session.get("questionnaire_questions") or []]
+        seen = list(dict.fromkeys(i for i in seen if i))
+        try:
+            questions = await ai_engine.generate_skill_test(skill_name, target_level, exclude_ids=seen)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to generate skill test: {str(e)}")
 
-    database.upsert_skill_test(session_id, skill_name, {
-        "status": "testing",
-        "questions": questions,
-        "answers": {},
-        "score": 0,
-        "passed": 0
-    })
+        database.upsert_skill_test(session_id, skill_name, {
+            "status": "testing",
+            "questions": questions,
+            "answers": {},
+            "score": 0,
+            "passed": 0,
+            "seen_question_ids": seen + [q["bank_id"] for q in questions if q.get("bank_id")],
+        })
 
     return {
-        "questions": questions,
+        "questions": [_public_question(q) for q in questions],
         "target_level": target_level,
         "total_questions": len(questions)
     }
@@ -612,6 +695,9 @@ async def get_skill_progress(session_id: str, skill_name: str):
     if not skill_test:
         raise HTTPException(status_code=404, detail="Skill test record not found")
 
+    if skill_test.get("questions") and not skill_test.get("answers"):
+        skill_test["questions"] = [_public_question(q) for q in skill_test["questions"]]
+    skill_test.pop("seen_question_ids", None)
     return skill_test
 
 
