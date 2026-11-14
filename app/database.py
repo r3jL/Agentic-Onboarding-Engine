@@ -10,6 +10,7 @@ Tables:
   - sessions: stores all candidate/session data including resume, JD, skill gaps, questionnaire, pathway
   - skill_tests: stores per-skill verification test data and results
   - question_bank: generated MCQs shared across sessions (cuts repeat LLM calls)
+  - pathway_bank: per-skill learning-plan entries shared across sessions
 """
 
 import atexit
@@ -214,6 +215,23 @@ def init_db():
         )
         cursor.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_question_bank_dedupe ON question_bank (skill_key, question_norm)"
+        )
+
+        # Shared pathway entries: the learning plan for (skill, from level, to level)
+        # is the same for every candidate, so it's generated once and reused.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pathway_bank (
+                id TEXT PRIMARY KEY,
+                skill_key TEXT NOT NULL,
+                from_level TEXT NOT NULL,
+                to_level TEXT NOT NULL,
+                entry TEXT NOT NULL,         -- JSON: {estimated_weeks, prerequisites, resources, learning_steps, practice_project}
+                model TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pathway_bank_key ON pathway_bank (skill_key, from_level, to_level)"
         )
 
         # Bank question ids a session has already seen in a skill test, so retests differ
@@ -515,6 +533,39 @@ def add_bank_questions(
     finally:
         conn.close()
     return ids
+
+
+def get_pathway_entry(skill_key: str, from_level: str, to_level: str) -> Optional[Dict[str, Any]]:
+    """Cached learning-plan entry for (skill, from level, to level), or None."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT entry FROM pathway_bank WHERE skill_key = ? AND from_level = ? AND to_level = ?",
+            (skill_key, from_level, to_level),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        return json.loads(row["entry"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def add_pathway_entry(skill_key: str, from_level: str, to_level: str, entry: Dict[str, Any], model: str):
+    """Store a learning-plan entry; a concurrent duplicate is ignored."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO pathway_bank (id, skill_key, from_level, to_level, entry, model, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), skill_key, from_level, to_level, json.dumps(entry), model,
+             datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 import secrets

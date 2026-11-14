@@ -160,6 +160,15 @@ class PathwaySkill(BaseModel):
     practice_project: Text = ""
 
 
+class SkillPlan(BaseModel):
+    """One skill's learning plan, generated on its own and cached across candidates."""
+    estimated_weeks: Number = 1
+    prerequisites: List[Text] = Field(default_factory=list)
+    resources: List[PathwayResource] = Field(default_factory=list)
+    learning_steps: List[LearningStep] = Field(default_factory=list)
+    practice_project: Text = ""
+
+
 class Pathway(BaseModel):
     total_estimated_weeks: Number = 0
     overview: Text = ""

@@ -3,6 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from app import ai_engine
 from app.main import app
 from conftest import JD_TEXT, RESUME_TEXT
 
@@ -70,12 +71,25 @@ def test_full_flow(client, llm):
     assert set(scores) == {"Machine Learning", "Kubernetes", "Container orchestration basics"}
     assert isinstance(client.get(f"/api/sessions/{sid}").json()["questionnaire_correct"], int)
 
-    # Pathway: generated once, resources get search links
+    # Pathway: one parallel call per gap skill, resources get search links, generated once
     pathway = client.post(f"/api/sessions/{sid}/pathway/generate").json()["pathway"]
+    gap_skills = {g["skill"] for g in gaps["skill_gaps"]}
+    assert {s["skill_name"] for s in pathway["skills"]} == gap_skills
     assert pathway["skills"][0]["resources"][0]["url"].startswith("https://www.google.com/search?q=")
-    assert pathway["learning_order"] == ["Machine Learning"]
+    order = pathway["learning_order"]
+    assert order.index("Machine Learning") < order.index("Kubernetes")   # prerequisite first
+    # weeks are capped at 2 per level climbed, and the total is their sum
+    for s in pathway["skills"]:
+        levels = ai_engine.LEVEL_RANK[s["target_level"]] - ai_engine.LEVEL_RANK[s["current_level"]]
+        assert s["estimated_weeks"] <= max(1, 2 * levels)
+    assert pathway["total_estimated_weeks"] == sum(s["estimated_weeks"] for s in pathway["skills"])
+    ml = next(s for s in pathway["skills"] if s["skill_name"] == "Machine Learning")
+    assert ml["target_level"] == "advanced" and ml["priority"] == "critical"
+    assert "your assessment placed you at" in ml["reasoning"]
+    pathway_calls = [c for c in llm.calls if c.startswith("pathway:")]
+    assert len(pathway_calls) == len(gap_skills)
     client.post(f"/api/sessions/{sid}/pathway/generate")
-    assert llm.calls.count("pathway") == 1
+    assert len([c for c in llm.calls if c.startswith("pathway:")]) == len(gap_skills)
 
     # Skill test: hidden answers, idempotent until answered, fresh on retest
     test = client.post(f"/api/sessions/{sid}/skills/Machine%20Learning/test/generate").json()
@@ -96,3 +110,23 @@ def test_full_flow(client, llm):
     client.post(f"/api/sessions/{sid}/pathway/generate", json={"regenerate": True})
     progress = client.get(f"/api/sessions/{sid}/pathway").json()["skill_progress"]
     assert progress["Machine Learning"]["attempts"] == 1
+
+
+def test_pathway_entries_are_reused_across_candidates(llm):
+    import asyncio
+    from app import ai_engine
+    gaps = {"skill_gaps": [
+        {"skill": "Kubernetes", "candidate_level": "none", "required_level": "advanced", "gap_severity": "critical", "priority": 1, "reason": "No evidence."},
+        {"skill": "Machine Learning", "candidate_level": "none", "required_level": "advanced", "gap_severity": "critical", "priority": 2, "reason": "No evidence."},
+    ]}
+    scores = {"Kubernetes": {"level": "beginner", "score": 20}, "Machine Learning": {"level": "basic", "score": 45}}
+    first = asyncio.run(ai_engine.generate_learning_pathway(scores, gaps, {}, {"role_title": "ML Engineer"}))
+    calls = len(llm.calls)
+    assert calls == 2
+    second = asyncio.run(ai_engine.generate_learning_pathway(scores, gaps, {}, {"role_title": "Other role"}))
+    assert len(llm.calls) == calls                                  # same skills and levels: no LLM calls
+    assert second["learning_order"] == first["learning_order"] == ["Machine Learning", "Kubernetes"]
+    assert "Other role" in second["overview"]                        # personal parts still per candidate
+    other = dict(scores, Kubernetes={"level": "basic", "score": 50})
+    asyncio.run(ai_engine.generate_learning_pathway(other, gaps, {}, {}))
+    assert llm.calls[calls:] == ["pathway:Kubernetes"]               # different level: one new entry

@@ -93,22 +93,18 @@ class FakeLLM:
                         "concept": f"concept {self.counter}",
                     })
             return {"questions": questions}
-        if label == "pathway":
+        if label.startswith("pathway:"):
+            skill = label.split(":", 1)[1]
             return {
-                "total_estimated_weeks": 10,
-                "overview": "Plan.",
-                "skills": [{
-                    "skill_name": "Machine Learning",
-                    "current_level": "none",
-                    "target_level": "Advanced",
-                    "priority": "critical",
-                    "estimated_weeks": 6,
-                    "resources": [
-                        {"type": "course", "title": "Machine Learning Specialization", "provider": "Coursera"},
-                        {"type": "video", "title": "Neural networks explained", "provider": "YouTube"},
-                    ],
-                    "learning_steps": [{"week": 1, "focus": "Basics", "tasks": ["Read"], "milestone": "Done"}],
-                }],
+                "estimated_weeks": 4,
+                # Kubernetes lists Machine Learning as a prerequisite, to exercise ordering
+                "prerequisites": ["Machine Learning basics"] if skill == "Kubernetes" else [],
+                "resources": [
+                    {"type": "course", "title": f"{skill} Specialization", "provider": "Coursera"},
+                    {"type": "video", "title": f"{skill} explained", "provider": "YouTube"},
+                ],
+                "learning_steps": [{"week": 1, "focus": "Basics", "tasks": ["Read"], "milestone": "Done"}],
+                "practice_project": f"Build something with {skill}.",
             }
         raise AssertionError(f"unexpected LLM call {label}")
 

@@ -36,8 +36,8 @@ from app.schemas import (
     JDData,
     MatchResult,
     MCQBatch,
-    Pathway,
     ResumeData,
+    SkillPlan,
     response_format,
 )
 
@@ -53,7 +53,7 @@ _MAX_TOKENS_CAP = int(os.environ["LLM_MAX_TOKENS"]) if os.environ.get("LLM_MAX_T
 # against max_tokens (budgets below are sized for the visible answer only)
 _REASONING_BUDGET = int(os.environ.get("LLM_REASONING_BUDGET", "0"))
 # Max LLM requests in flight at once (parallel question generation respects this)
-_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("LLM_CONCURRENCY", "4")))
+_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("LLM_CONCURRENCY", "8")))
 # Structured output is switched off automatically if the provider rejects it
 _use_json_schema = os.environ.get("LLM_JSON_SCHEMA", "true").lower() != "false"
 
@@ -763,45 +763,116 @@ def resource_url(resource: Dict[str, str]) -> str:
     return "https://www.google.com/search?q=" + quote_plus(query)
 
 
+async def _skill_plan(skill: str, from_level: str, to_level: str) -> Dict[str, Any]:
+    """One skill's learning plan: from the pathway bank, or generated and cached."""
+    key = skill_key(skill)
+    cached = database.get_pathway_entry(key, from_level, to_level)
+    if cached:
+        return cached
+
+    start = "no prior knowledge" if from_level in ("none", "", None) else f"{from_level} level"
+    # A focused onboarding plan: about 2 weeks per proficiency level to climb
+    max_weeks = max(1, 2 * (LEVEL_RANK.get(to_level, 3) - LEVEL_RANK.get(from_level or "none", 0)))
+    prompt = f"""Design a focused onboarding plan that takes a working software professional from {start} to {to_level} level in {skill}.
+Return: {{"estimated_weeks":number,"prerequisites":[str],"resources":[{{"type":"course|book|docs|video|practice|article","title":str,"provider":str}}],"learning_steps":[{{"week":"1 or 2-3","focus":str,"tasks":[str],"milestone":str}}],"practice_project":"1 sentence"}}
+Rules:
+- estimated_weeks: at most {max_weeks}; cover what the job needs rather than the whole field.
+- prerequisites: other skills to learn first (short names), or [] if none.
+- resources: 3 well-known, real resources (title and provider only, no URLs).
+- learning_steps: at most 4, covering all the weeks; group weeks (e.g. "3-4"); 2-3 short tasks each."""
+    raw = await _complete_json(f"pathway:{skill}", prompt, SkillPlan, max_tokens=1200)
+    plan = SkillPlan.model_validate(raw).model_dump()
+    plan["estimated_weeks"] = min(max(plan["estimated_weeks"], 1), max_weeks)
+    database.add_pathway_entry(key, from_level, to_level, plan, MODEL)
+    return plan
+
+
+def order_pathway(skills: List[Dict]) -> List[Dict]:
+    """
+    Order skills so that any gap skill listed as another's prerequisite comes
+    first; otherwise keep the given (priority) order. Cycles fall back to priority.
+    """
+    keys = [skill_key(s["skill_name"]) for s in skills]
+
+    def depends_on(skill: Dict) -> set:
+        own = skill_key(skill["skill_name"])
+        found = set()
+        for prereq in skill.get("prerequisites", []):
+            pk = skill_key(prereq)
+            found.update(k for k in keys if k != own and re.search(rf"(^|\s){re.escape(k)}(\s|$)", pk))
+        return found
+
+    deps = {skill_key(s["skill_name"]): depends_on(s) for s in skills}
+    ordered, placed, remaining = [], set(), list(skills)
+    while remaining:
+        ready = next((s for s in remaining if deps[skill_key(s["skill_name"])] <= placed), remaining[0])
+        ordered.append(ready)
+        placed.add(skill_key(ready["skill_name"]))
+        remaining.remove(ready)
+    return ordered
+
+
 async def generate_learning_pathway(
     proficiency_scores: Dict,
     skill_gaps: Dict,
     resume_data: Dict,
     jd_data: Dict
 ) -> Dict[str, Any]:
-    """Generate a personalised learning pathway covering every skill gap."""
-    gaps = []
-    for gap in skill_gaps.get("skill_gaps", []):
+    """
+    Personalised learning pathway covering every skill gap.
+
+    Each skill's plan is generated in its own request, all in parallel, and cached
+    by (skill, current level, target level) so later candidates reuse it. The
+    personal parts — levels, priority, the "why" line, order and totals — are
+    filled in here per candidate.
+    """
+    gaps = sorted(skill_gaps.get("skill_gaps", []), key=lambda g: g.get("priority", 99))
+    targets = []
+    for gap in gaps:
         assessed = proficiency_scores.get(gap["skill"], {})
-        gaps.append({
-            "skill": gap["skill"],
-            "assessed_level": assessed.get("level", gap.get("candidate_level")),
-            "assessed_score": assessed.get("score"),
-            "required_level": gap.get("required_level"),
-            "severity": gap.get("gap_severity"),
-        })
+        targets.append((gap, assessed.get("level") or gap.get("candidate_level") or "none",
+                        gap.get("required_level") or "intermediate", assessed.get("score")))
 
-    prompt = f"""You are a learning and development specialist. Design a learning pathway that closes every skill gap below.
-Return: {{"total_estimated_weeks":number,"overview":"2 sentences","skills":[{{"skill_name":str,"current_level":str,"target_level":"basic|intermediate|advanced|expert","priority":"critical|high|medium|low","estimated_weeks":number,"reasoning":"1 sentence","prerequisites":[str],"resources":[{{"type":"course|book|docs|video|practice|article","title":str,"provider":str}}],"learning_steps":[{{"week":"1 or 2-3","focus":str,"tasks":[str],"milestone":str}}],"practice_project":"1 sentence"}}]}}
-Rules:
-- One entry per skill gap, using the exact skill names given, ordered so prerequisites come first.
-- current_level = assessed_level; target_level = required_level; priority from severity.
-- resources: 3 well-known, real resources (title and provider only, no URLs).
-- learning_steps: at most 4; group weeks (e.g. "3-4") when estimated_weeks > 4; 2-3 short tasks each.
-- estimated_weeks realistic for the gap; total_estimated_weeks assumes skills are learned in order.
+    plans = await asyncio.gather(
+        *(_skill_plan(gap["skill"], current, target) for gap, current, target, _ in targets),
+        return_exceptions=True,
+    )
 
-ROLE: {jd_data.get('role_title', 'Software Engineer')}
-CANDIDATE: {resume_data.get('total_experience_years', 0)} years experience
-SKILL GAPS: {_compact(gaps)}"""
+    skills = []
+    for (gap, current, target, score), plan in zip(targets, plans):
+        if isinstance(plan, Exception):
+            log.warning("Pathway generation failed for %s: %s", gap["skill"], plan)
+            continue
+        assessed = f"your assessment placed you at {current} ({score}%)" if score is not None \
+            else f"your résumé shows {current} level"
+        entry = {
+            "skill_name": gap["skill"],
+            "current_level": current,
+            "target_level": target,
+            "priority": gap.get("gap_severity", "medium"),
+            "reasoning": f"The role needs {target} {gap['skill']}; {assessed}. {gap.get('reason', '')}".strip(),
+            **plan,
+        }
+        entry["resources"] = [dict(r, url=resource_url(r)) for r in plan.get("resources", [])]
+        skills.append(entry)
 
-    raw = await _complete_json("pathway", prompt, Pathway, max_tokens=max(2000, 700 * len(gaps) + 300))
-    pathway = Pathway.model_validate(raw).model_dump()
+    if not skills:
+        errors = [p for p in plans if isinstance(p, Exception)]
+        raise ValueError(f"Could not generate a pathway: {errors[0] if errors else 'no skill gaps'}")
 
-    for skill in pathway["skills"]:
-        for resource in skill["resources"]:
-            resource["url"] = resource_url(resource)
-    pathway["learning_order"] = [s["skill_name"] for s in pathway["skills"]]
-    return pathway
+    skills = order_pathway(skills)
+    total_weeks = round(sum(float(s.get("estimated_weeks") or 0) for s in skills))
+    names = [s["skill_name"] for s in skills]
+    critical = sum(1 for s in skills if s["priority"] in ("critical", "high"))
+    overview = (f"A {total_weeks}-week plan across {len(skills)} skills for the "
+                f"{jd_data.get('role_title') or 'target'} role, starting with {', '.join(names[:2])}. "
+                f"{critical} of the gaps are high priority, so they come early in the plan.")
+    return {
+        "total_estimated_weeks": total_weeks,
+        "overview": overview,
+        "skills": skills,
+        "learning_order": names,
+    }
 
 
 # ---------------------------------------------------------------------------

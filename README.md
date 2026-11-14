@@ -157,10 +157,11 @@ Level:  ≥85% → advanced
 
 ### 4. Personalized Learning Pathway
 
-- Learning order optimized for prerequisites (foundational skills first)
-- Week-by-week breakdown with specific tasks and milestones
+- Each skill's plan is generated in its own request, all in parallel (~13s for 8 skills instead of ~75s as one request)
+- Plans are cached by (skill, current level, target level) and reused for later candidates, so repeat skills cost nothing
+- Learning order puts prerequisites first, then follows gap priority; levels, priority and the "why" line stay personal
+- Week-by-week breakdown with specific tasks and milestones, budgeted at about 2 weeks per proficiency level
 - Practice project and 3 resources per skill (links are search URLs, so they never 404)
-- Estimated timeline based on gap severity
 
 ### 5. Skill Verification Tests
 
@@ -225,7 +226,7 @@ Level:  ≥85% → advanced
 | `LLM_MODEL` | No | Model name (default: `qwen2.5:7b`) |
 | `LLM_MAX_TOKENS` | No | Upper bound on `max_tokens` per request, for providers with lower output limits |
 | `LLM_REASONING_BUDGET` | No | Extra tokens added to every request when using a reasoning model, whose hidden thinking counts against `max_tokens` (default `0`). A non-reasoning model is cheaper and faster for this app. |
-| `LLM_CONCURRENCY` | No | Max LLM requests in flight at once (default: `4`; lower it for strict free tiers) |
+| `LLM_CONCURRENCY` | No | Max LLM requests in flight at once (default: `8`; lower it for strict free tiers) |
 | `LLM_JSON_SCHEMA` | No | Set `false` if the provider rejects `response_format` JSON schemas (detected automatically otherwise) |
 | `LLM_TIMEOUT` / `LLM_MAX_RETRIES` | No | Request timeout in seconds (default `600`) / retries on rate limits and server errors, with 2s → 8s → 20s → 45s backoff or the provider's `retry-after` (default `4`) |
 | `PORT` | No | Port to listen on (default: `8000`; most hosts set this automatically) |
