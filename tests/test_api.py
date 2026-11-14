@@ -86,10 +86,11 @@ def test_full_flow(client, llm):
     ml = next(s for s in pathway["skills"] if s["skill_name"] == "Machine Learning")
     assert ml["target_level"] == "advanced" and ml["priority"] == "critical"
     assert "your assessment placed you at" in ml["reasoning"]
-    pathway_calls = [c for c in llm.calls if c.startswith("pathway:")]
-    assert len(pathway_calls) == len(gap_skills)
+    # one call per skill that needs a plan (skills already at target are verify-only)
+    to_study = sum(1 for s in pathway["skills"] if not s["verify_only"])
+    assert len([c for c in llm.calls if c.startswith("pathway:")]) == to_study
     client.post(f"/api/sessions/{sid}/pathway/generate")
-    assert len([c for c in llm.calls if c.startswith("pathway:")]) == len(gap_skills)
+    assert len([c for c in llm.calls if c.startswith("pathway:")]) == to_study
 
     # Skill test: hidden answers, idempotent until answered, fresh on retest
     test = client.post(f"/api/sessions/{sid}/skills/Machine%20Learning/test/generate").json()
@@ -130,3 +131,27 @@ def test_pathway_entries_are_reused_across_candidates(llm):
     other = dict(scores, Kubernetes={"level": "basic", "score": 50})
     asyncio.run(ai_engine.generate_learning_pathway(other, gaps, {}, {}))
     assert llm.calls[calls:] == ["pathway:Kubernetes"]               # different level: one new entry
+
+
+def test_already_met_skills_are_verify_only(llm):
+    import asyncio
+    from app import ai_engine
+    gaps = {"skill_gaps": [
+        {"skill": "Kubernetes", "candidate_level": "none", "required_level": "intermediate", "gap_severity": "high", "priority": 1, "reason": "No evidence."},
+        {"skill": "Machine Learning", "candidate_level": "none", "required_level": "advanced", "gap_severity": "critical", "priority": 2, "reason": "No evidence."},
+    ]}
+    # Kubernetes assessed at intermediate = the required level; Machine Learning still below
+    scores = {"Kubernetes": {"level": "intermediate", "score": 70}, "Machine Learning": {"level": "basic", "score": 45}}
+    p = asyncio.run(ai_engine.generate_learning_pathway(scores, gaps, {}, {"role_title": "ML Engineer"}))
+    assert llm.calls == ["pathway:Machine Learning"]                 # no plan generated for Kubernetes
+    assert p["learning_order"] == ["Machine Learning", "Kubernetes"]  # verify-only goes last
+    k8s = p["skills"][1]
+    assert k8s["verify_only"] and k8s["estimated_weeks"] == 0 and k8s["learning_steps"] == []
+    assert "meets the intermediate level" in k8s["reasoning"]
+    assert p["total_estimated_weeks"] == p["skills"][0]["estimated_weeks"]
+    assert "just take the verification test" in p["overview"]
+
+    all_met = {"Kubernetes": {"level": "intermediate", "score": 70}, "Machine Learning": {"level": "advanced", "score": 90}}
+    p2 = asyncio.run(ai_engine.generate_learning_pathway(all_met, gaps, {}, {"role_title": "ML Engineer"}))
+    assert all(s["verify_only"] for s in p2["skills"]) and p2["total_estimated_weeks"] == 0
+    assert llm.calls == ["pathway:Machine Learning"]                 # still no extra calls

@@ -827,11 +827,16 @@ async def generate_learning_pathway(
     filled in here per candidate.
     """
     gaps = sorted(skill_gaps.get("skill_gaps", []), key=lambda g: g.get("priority", 99))
-    targets = []
+    targets, verify_only = [], []
     for gap in gaps:
         assessed = proficiency_scores.get(gap["skill"], {})
-        targets.append((gap, assessed.get("level") or gap.get("candidate_level") or "none",
-                        gap.get("required_level") or "intermediate", assessed.get("score")))
+        current = assessed.get("level") or gap.get("candidate_level") or "none"
+        target = gap.get("required_level") or "intermediate"
+        if LEVEL_RANK.get(current, 0) >= LEVEL_RANK.get(target, 3):
+            # The assessment shows they already meet the bar: no study plan, just verify
+            verify_only.append(_verify_only_entry(gap, current, target, assessed.get("score")))
+        else:
+            targets.append((gap, current, target, assessed.get("score")))
 
     plans = await asyncio.gather(
         *(_skill_plan(gap["skill"], current, target) for gap, current, target, _ in targets),
@@ -851,27 +856,55 @@ async def generate_learning_pathway(
             "target_level": target,
             "priority": gap.get("gap_severity", "medium"),
             "reasoning": f"The role needs {target} {gap['skill']}; {assessed}. {gap.get('reason', '')}".strip(),
+            "verify_only": False,
             **plan,
         }
         entry["resources"] = [dict(r, url=resource_url(r)) for r in plan.get("resources", [])]
         skills.append(entry)
 
-    if not skills:
+    if not skills and not verify_only:
         errors = [p for p in plans if isinstance(p, Exception)]
         raise ValueError(f"Could not generate a pathway: {errors[0] if errors else 'no skill gaps'}")
 
-    skills = order_pathway(skills)
+    # Skills to study come first (prerequisites, then priority); verify-only skills last
+    skills = order_pathway(skills) + verify_only
     total_weeks = round(sum(float(s.get("estimated_weeks") or 0) for s in skills))
-    names = [s["skill_name"] for s in skills]
-    critical = sum(1 for s in skills if s["priority"] in ("critical", "high"))
-    overview = (f"A {total_weeks}-week plan across {len(skills)} skills for the "
-                f"{jd_data.get('role_title') or 'target'} role, starting with {', '.join(names[:2])}. "
-                f"{critical} of the gaps are high priority, so they come early in the plan.")
+    study = [s["skill_name"] for s in skills if not s.get("verify_only")]
+    role = jd_data.get("role_title") or "target"
+    if study:
+        critical = sum(1 for s in skills if not s.get("verify_only") and s["priority"] in ("critical", "high"))
+        overview = (f"A {total_weeks}-week plan across {len(study)} skills for the {role} role, "
+                    f"starting with {', '.join(study[:2])}. "
+                    f"{critical} of the gaps are high priority, so they come early in the plan.")
+    else:
+        overview = f"Your assessment shows you already meet the {role} role's requirements."
+    if verify_only:
+        overview += (f" You already meet the bar for {len(verify_only)} more "
+                     f"skill{'s' if len(verify_only) != 1 else ''}: just take the verification test.")
     return {
         "total_estimated_weeks": total_weeks,
         "overview": overview,
         "skills": skills,
-        "learning_order": names,
+        "learning_order": [s["skill_name"] for s in skills],
+    }
+
+
+def _verify_only_entry(gap: Dict, current: str, target: str, score: Optional[int]) -> Dict[str, Any]:
+    """Pathway entry for a skill the assessment shows is already at the required level."""
+    shown = f"{current} ({score}%)" if score is not None else current
+    return {
+        "skill_name": gap["skill"],
+        "current_level": current,
+        "target_level": target,
+        "priority": gap.get("gap_severity", "low"),
+        "verify_only": True,
+        "reasoning": (f"Your assessment placed you at {shown}, which meets the {target} level "
+                      f"the role needs. No study plan needed: take the verification test to confirm it."),
+        "estimated_weeks": 0,
+        "prerequisites": [],
+        "resources": [],
+        "learning_steps": [],
+        "practice_project": "",
     }
 
 
